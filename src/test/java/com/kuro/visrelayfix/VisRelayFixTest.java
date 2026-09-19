@@ -8,9 +8,11 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
@@ -303,6 +305,118 @@ public class VisRelayFixTest {
         assertSame(second, third.getParent().get());
     }
 
+    @Test
+    public void verticalRoutesSurviveRepeatedPartialReloads() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode first = new FakeNode(world, 0, 70, 0, false);
+        FakeNode second = new FakeNode(world, 0, 76, 0, false);
+        connect(source, first);
+        connect(first, second);
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.validateExistingConnection(first);
+        VisRelayChunkLoader.validateExistingConnection(second);
+
+        for (int reload = 0; reload < 3; reload++) {
+            source = new FakeNode(world, 0, 64, 0, true);
+            first = new FakeNode(world, 0, 70, 0, false);
+            second = new FakeNode(world, 0, 76, 0, false);
+            VisRelayChunkLoader.registerNode(source);
+            VisRelayChunkLoader.registerNode(second);
+
+            VisRelayChunkLoader.validateExistingConnection(second);
+            assertNull(second.getParent());
+
+            VisRelayChunkLoader.registerNode(first);
+            VisRelayChunkLoader.validateExistingConnection(second);
+
+            assertSame(source, first.getParent().get());
+            assertSame(first, second.getParent().get());
+        }
+    }
+
+    @Test
+    public void inactiveRememberedRoutesArePrunedFromLongLivedWorlds() throws Exception {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode relay = new FakeNode(world, 0, 70, 0, false);
+        connect(source, relay);
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(relay);
+        assertEquals(1, rememberedParentCount(world));
+
+        world.totalWorldTime = 1_000_000L;
+        VisRelayChunkLoader.validateExistingConnection(source);
+
+        assertEquals(0, rememberedParentCount(world));
+    }
+
+    @Test
+    public void staleNodeReferencesArePrunedFromLongLivedWorlds() throws Exception {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode removedRelay = new FakeNode(world, 10, 64, 0, false);
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(removedRelay);
+        assertEquals(2, registeredNodeCount(world));
+
+        world.removeTileEntity(10, 64, 0);
+        world.totalWorldTime = 1_000_000L;
+        VisRelayChunkLoader.validateExistingConnection(source);
+
+        assertEquals(1, registeredNodeCount(world));
+    }
+
+    @Test
+    public void partialChunkUnloadPrunesNodesButKeepsTheRememberedRoute() throws Exception {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode oldSource = new FakeNode(world, 32, 64, 0, true);
+        FakeNode relay = new FakeNode(world, 28, 64, 0, false);
+        connect(oldSource, relay);
+
+        VisRelayChunkLoader.registerNode(oldSource);
+        VisRelayChunkLoader.registerNode(relay);
+        assertEquals(2, registeredNodeCount(world));
+        assertEquals(1, rememberedParentCount(world));
+
+        world.chunkProvider.setLoaded(2, 0, false);
+        world.totalWorldTime = 1_200L;
+        VisRelayChunkLoader.registerNode(relay);
+
+        assertEquals(1, registeredNodeCount(world));
+        assertEquals(1, rememberedParentCount(world));
+
+        FakeNode reloadedSource = new FakeNode(world, 32, 64, 0, true);
+        world.chunkProvider.setLoaded(2, 0, true);
+        VisRelayChunkLoader.registerNode(reloadedSource);
+        WeakReference<Object> recovered = VisRelayChunkLoader.recoverIfDisconnected(null, relay);
+
+        assertSame(reloadedSource, recovered.get());
+        relay.setParent(new WeakReference<>(reloadedSource));
+        assertSame(reloadedSource, relay.getParent().get());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static int rememberedParentCount(FakeWorld world) throws Exception {
+        Field cache = VisRelayChunkLoader.class.getDeclaredField("LAST_KNOWN_PARENTS");
+        cache.setAccessible(true);
+        Map<Object, Map<?, ?>> parents = (Map<Object, Map<?, ?>>) cache.get(null);
+        Map<?, ?> worldParents = parents.get(world);
+        return worldParents == null ? 0 : worldParents.size();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static int registeredNodeCount(FakeWorld world) throws Exception {
+        Field cache = VisRelayChunkLoader.class.getDeclaredField("NODES");
+        cache.setAccessible(true);
+        Map<Object, Map<?, ?>> nodes = (Map<Object, Map<?, ?>>) cache.get(null);
+        Map<?, ?> worldNodes = nodes.get(world);
+        return worldNodes == null ? 0 : worldNodes.size();
+    }
+
     private static void connect(FakeNode parent, FakeNode child) {
         child.setParent(new WeakReference<>(parent));
         parent.children.add(new WeakReference<>(child));
@@ -323,6 +437,10 @@ public class VisRelayFixTest {
 
         private void setTileEntity(FakeNode node) {
             tileEntities.put(node.xCoord + ":" + node.yCoord + ":" + node.zCoord, node);
+        }
+
+        void removeTileEntity(int x, int y, int z) {
+            tileEntities.remove(x + ":" + y + ":" + z);
         }
     }
 

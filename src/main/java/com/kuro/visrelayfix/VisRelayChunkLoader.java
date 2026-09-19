@@ -16,12 +16,15 @@ import java.util.WeakHashMap;
 public final class VisRelayChunkLoader {
     private static final long LOAD_SETTLE_TICKS = 40L;
     private static final long RECOVERY_INTERVAL_TICKS = 200L;
+    private static final long STATE_CLEANUP_INTERVAL_TICKS = 1_200L;
+    private static final long REMEMBERED_PARENT_RETENTION_TICKS = 432_000L;
     private static final Map<Object, Map<NodeKey, WeakReference<Object>>> NODES = new WeakHashMap<>();
-    private static final Map<Object, Map<NodeKey, NodeKey>> LAST_KNOWN_PARENTS = new WeakHashMap<>();
+    private static final Map<Object, Map<NodeKey, RememberedParent>> LAST_KNOWN_PARENTS = new WeakHashMap<>();
     private static final Map<Object, Long> VALIDATION_DUE = new WeakHashMap<>();
     private static final Map<Object, Long> NEXT_RECOVERY = new WeakHashMap<>();
     private static final Map<Object, Boolean> BROKEN_LOGGED = new WeakHashMap<>();
     private static final Map<Object, Boolean> VALIDATED_ON_LOAD = new WeakHashMap<>();
+    private static final Map<Object, Long> NEXT_STATE_CLEANUP = new WeakHashMap<>();
 
     private VisRelayChunkLoader() {
     }
@@ -213,6 +216,7 @@ public final class VisRelayChunkLoader {
             return;
         }
 
+        cleanupWorldState(world);
         synchronized (NODES) {
             Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(world);
             if (worldNodes == null) {
@@ -368,12 +372,12 @@ public final class VisRelayChunkLoader {
         }
 
         synchronized (NODES) {
-            Map<NodeKey, NodeKey> worldParents = LAST_KNOWN_PARENTS.get(world);
+            Map<NodeKey, RememberedParent> worldParents = LAST_KNOWN_PARENTS.get(world);
             if (worldParents == null) {
                 worldParents = new HashMap<>();
                 LAST_KNOWN_PARENTS.put(world, worldParents);
             }
-            worldParents.put(nodeKey, parentKey);
+            worldParents.put(nodeKey, new RememberedParent(parentKey, readWorldTime(world)));
         }
     }
 
@@ -384,15 +388,66 @@ public final class VisRelayChunkLoader {
         }
 
         synchronized (NODES) {
-            Map<NodeKey, NodeKey> worldParents = LAST_KNOWN_PARENTS.get(world);
+            Map<NodeKey, RememberedParent> worldParents = LAST_KNOWN_PARENTS.get(world);
             Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(world);
             if (worldParents == null || worldNodes == null) {
                 return null;
             }
 
-            NodeKey parentKey = worldParents.get(nodeKey);
-            WeakReference<Object> parent = parentKey == null ? null : worldNodes.get(parentKey);
-            return isValidReference(parent) ? parent : null;
+            RememberedParent remembered = worldParents.get(nodeKey);
+            WeakReference<Object> parent = remembered == null ? null : worldNodes.get(remembered.parentKey);
+            if (!isValidReference(parent)) {
+                return null;
+            }
+            remembered.lastUsedAt = readWorldTime(world);
+            return parent;
+        }
+    }
+
+    /**
+     * The weak maps release worlds and TileEntities, but their coordinate keys
+     * still need pruning while a server world remains open. Keep remembered
+     * links long enough for ordinary chunk travel, then drop inactive routes.
+     */
+    private static void cleanupWorldState(Object world) {
+        long worldTime = readWorldTime(world);
+        if (worldTime < 0L) {
+            return;
+        }
+
+        synchronized (NODES) {
+            Long nextCleanup = NEXT_STATE_CLEANUP.get(world);
+            if (nextCleanup != null && worldTime < nextCleanup) {
+                return;
+            }
+            NEXT_STATE_CLEANUP.put(world, worldTime + STATE_CLEANUP_INTERVAL_TICKS);
+
+            Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(world);
+            if (worldNodes != null) {
+                for (java.util.Iterator<Map.Entry<NodeKey, WeakReference<Object>>> iterator = worldNodes.entrySet().iterator(); iterator.hasNext();) {
+                    Object candidate = iterator.next().getValue().get();
+                    if (candidate == null || !isLiveNode(candidate)) {
+                        iterator.remove();
+                    }
+                }
+                if (worldNodes.isEmpty()) {
+                    NODES.remove(world);
+                }
+            }
+
+            Map<NodeKey, RememberedParent> worldParents = LAST_KNOWN_PARENTS.get(world);
+            if (worldParents != null) {
+                for (java.util.Iterator<RememberedParent> iterator = worldParents.values().iterator(); iterator.hasNext();) {
+                    RememberedParent remembered = iterator.next();
+                    if (remembered.lastUsedAt >= 0L
+                            && worldTime - remembered.lastUsedAt > REMEMBERED_PARENT_RETENTION_TICKS) {
+                        iterator.remove();
+                    }
+                }
+                if (worldParents.isEmpty()) {
+                    LAST_KNOWN_PARENTS.remove(world);
+                }
+            }
         }
     }
 
@@ -960,6 +1015,16 @@ public final class VisRelayChunkLoader {
             int result = x;
             result = 31 * result + y;
             return 31 * result + z;
+        }
+    }
+
+    private static final class RememberedParent {
+        private final NodeKey parentKey;
+        private long lastUsedAt;
+
+        private RememberedParent(NodeKey parentKey, long lastUsedAt) {
+            this.parentKey = parentKey;
+            this.lastUsedAt = lastUsedAt;
         }
     }
 }
