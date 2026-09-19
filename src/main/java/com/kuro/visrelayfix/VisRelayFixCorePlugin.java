@@ -1,7 +1,9 @@
 package com.kuro.visrelayfix;
 
 import cpw.mods.fml.relauncher.IFMLLoadingPlugin;
+import cpw.mods.fml.common.FMLLog;
 
+import java.io.File;
 import java.util.Map;
 
 @IFMLLoadingPlugin.Name("Thaumcraft Vis Relay Fix")
@@ -24,7 +26,11 @@ public final class VisRelayFixCorePlugin implements IFMLLoadingPlugin {
 
     @Override
     public void injectData(Map<String, Object> data) {
-        // No launch-time configuration is required.
+        Object mcLocation = data.get("mcLocation");
+        if (mcLocation instanceof File) {
+            VisRelayFixConfig.initialize((File) mcLocation);
+        }
+        FMLLog.info("[VisRelayFix] Thaumcraft Vis Relay Fix 1.1.7 loaded.");
     }
 
     @Override

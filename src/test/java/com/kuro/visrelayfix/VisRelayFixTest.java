@@ -9,10 +9,15 @@ import org.objectweb.asm.Opcodes;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
 
 public class VisRelayFixTest {
     @Test
@@ -64,10 +69,11 @@ public class VisRelayFixTest {
             }
         }, 0);
 
-        assertEquals(3, hooks.size());
-        assertEquals("registerNode", hooks.get(0));
-        assertEquals("ensureNearbyChunksLoaded", hooks.get(1));
-        assertEquals("recoverIfDisconnected", hooks.get(2));
+        assertEquals(4, hooks.size());
+        assertEquals("validateExistingConnection", hooks.get(0));
+        assertEquals("registerNode", hooks.get(1));
+        assertEquals("ensureNearbyChunksLoaded", hooks.get(2));
+        assertEquals("recoverIfDisconnected", hooks.get(3));
     }
 
     @Test
@@ -85,8 +91,177 @@ public class VisRelayFixTest {
         assertSame(target, source.children.get(0).get());
     }
 
-    public static final class FakeWorld {
+    @Test
+    public void relayWithLiveButDisconnectedParentRepairsBrokenAncestor() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode disconnectedRelay = new FakeNode(world, 3, 64, 0, false);
+        FakeNode target = new FakeNode(world, 5, 64, 0, false);
+        target.setParent(new WeakReference<>(disconnectedRelay));
+        disconnectedRelay.children.add(new WeakReference<>(target));
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(disconnectedRelay);
+        VisRelayChunkLoader.registerNode(target);
+        VisRelayChunkLoader.validateExistingConnection(target);
+
+        assertSame(disconnectedRelay, target.getParent().get());
+        assertEquals(1, source.children.size());
+        assertSame(disconnectedRelay, source.children.get(0).get());
+        assertEquals(1, disconnectedRelay.children.size());
+        assertSame(target, disconnectedRelay.children.get(0).get());
+        assertSame(source, disconnectedRelay.getParent().get());
+        assertFalse(target.nodeRefresh);
+    }
+
+    @Test
+    public void downstreamRelayDoesNotJumpToNearbySiblingDuringAncestorRepair() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode healthySibling = new FakeNode(world, 3, 64, 0, false);
+        FakeNode brokenAncestor = new FakeNode(world, 8, 64, 0, false);
+        FakeNode downstream = new FakeNode(world, 11, 64, 0, false);
+        healthySibling.setParent(new WeakReference<>(source));
+        brokenAncestor.children.add(new WeakReference<>(downstream));
+        downstream.setParent(new WeakReference<>(brokenAncestor));
+        source.children.add(new WeakReference<>(healthySibling));
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(healthySibling);
+        VisRelayChunkLoader.registerNode(brokenAncestor);
+        VisRelayChunkLoader.registerNode(downstream);
+        VisRelayChunkLoader.validateExistingConnection(downstream);
+
+        assertSame(brokenAncestor, downstream.getParent().get());
+        assertSame(healthySibling, brokenAncestor.getParent().get());
+        assertEquals(1, brokenAncestor.children.size());
+        assertSame(downstream, brokenAncestor.children.get(0).get());
+    }
+
+    @Test
+    public void refreshRestoresRememberedParentInsteadOfNearbySibling() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode rememberedParent = new FakeNode(world, 3, 64, 0, false);
+        FakeNode nearbySibling = new FakeNode(world, 4, 64, 0, false);
+        FakeNode target = new FakeNode(world, 5, 64, 0, false);
+        rememberedParent.setParent(new WeakReference<>(source));
+        nearbySibling.setParent(new WeakReference<>(source));
+        target.setParent(new WeakReference<>(rememberedParent));
+        source.children.add(new WeakReference<>(rememberedParent));
+        source.children.add(new WeakReference<>(nearbySibling));
+        rememberedParent.children.add(new WeakReference<>(target));
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(rememberedParent);
+        VisRelayChunkLoader.registerNode(nearbySibling);
+        VisRelayChunkLoader.validateExistingConnection(target);
+
+        target.setParent(null);
+        nearbySibling.children.add(new WeakReference<>(target));
+        WeakReference<Object> recovered = VisRelayChunkLoader.recoverIfDisconnected(
+                new WeakReference<Object>(nearbySibling),
+                target
+        );
+
+        assertSame(rememberedParent, recovered.get());
+        assertEquals(1, rememberedParent.children.size());
+        assertSame(target, rememberedParent.children.get(0).get());
+        assertTrue(nearbySibling.children.isEmpty());
+    }
+
+    @Test
+    public void relayWithoutAnyParentRequestsThaumcraftConnectionRetry() {
+        FakeWorld world = new FakeWorld();
+        FakeNode target = new FakeNode(world, 5, 64, 0, false);
+
+        VisRelayChunkLoader.validateExistingConnection(target);
+
+        assertTrue(target.nodeRefresh);
+    }
+
+    @Test
+    public void relayConnectionIsValidatedOnlyOncePerLoad() {
+        FakeWorld world = new FakeWorld();
+        FakeNode target = new FakeNode(world, 5, 64, 0, false);
+
+        VisRelayChunkLoader.validateExistingConnection(target);
+        target.nodeRefresh = false;
+
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.validateExistingConnection(target);
+
+        assertNull(target.getParent());
+        assertFalse(target.nodeRefresh);
+        assertTrue(source.children.isEmpty());
+    }
+
+    @Test
+    public void relayValidationWaitsForLoadedGridToSettle() {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode target = new FakeNode(world, 5, 64, 0, false);
+
+        VisRelayChunkLoader.validateExistingConnection(target);
+        assertFalse(target.nodeRefresh);
+
+        world.totalWorldTime = 39L;
+        VisRelayChunkLoader.validateExistingConnection(target);
+        assertFalse(target.nodeRefresh);
+
+        world.totalWorldTime = 40L;
+        VisRelayChunkLoader.validateExistingConnection(target);
+        assertTrue(target.nodeRefresh);
+    }
+
+    @Test
+    public void relayDoesNotTreatSourceInUnloadedChunkAsEnergized() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 32, 64, 0, true);
+        FakeNode target = new FakeNode(world, 28, 64, 0, false);
+        target.setParent(new WeakReference<>(source));
+        source.children.add(new WeakReference<>(target));
+        world.chunkProvider.setLoaded(2, 0, false);
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(target);
+        VisRelayChunkLoader.validateExistingConnection(target);
+
+        assertTrue(target.nodeRefresh);
+    }
+
+    public static class FakeWorld {
         public boolean isRemote;
+        public final FakeChunkProvider chunkProvider = new FakeChunkProvider();
+
+        public FakeChunkProvider getChunkProvider() {
+            return chunkProvider;
+        }
+    }
+
+    public static final class TimedFakeWorld extends FakeWorld {
+        public long totalWorldTime;
+
+        public long getTotalWorldTime() {
+            return totalWorldTime;
+        }
+    }
+
+    public static final class FakeChunkProvider {
+        private final Set<String> unavailableChunks = new HashSet<>();
+
+        public boolean chunkExists(int x, int z) {
+            return !unavailableChunks.contains(x + ":" + z);
+        }
+
+        public void setLoaded(int x, int z, boolean loaded) {
+            String key = x + ":" + z;
+            if (loaded) {
+                unavailableChunks.remove(key);
+            } else {
+                unavailableChunks.add(key);
+            }
+        }
     }
 
     public static final class FakeNode {
@@ -95,7 +270,9 @@ public class VisRelayFixTest {
         public final int yCoord;
         public final int zCoord;
         public final List<WeakReference<FakeNode>> children = new ArrayList<>();
+        public boolean nodeRefresh;
         private final boolean source;
+        private WeakReference<FakeNode> parent;
 
         private FakeNode(FakeWorld world, int x, int y, int z, boolean source) {
             this.worldObj = world;
@@ -114,7 +291,11 @@ public class VisRelayFixTest {
         }
 
         public WeakReference<FakeNode> getParent() {
-            return null;
+            return parent;
+        }
+
+        public void setParent(WeakReference<FakeNode> parent) {
+            this.parent = parent;
         }
 
         public List<WeakReference<FakeNode>> getChildren() {

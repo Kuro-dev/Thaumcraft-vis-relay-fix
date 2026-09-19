@@ -5,16 +5,23 @@ import cpw.mods.fml.common.FMLLog;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.ref.WeakReference;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 
 public final class VisRelayChunkLoader {
+    private static final long LOAD_SETTLE_TICKS = 40L;
     private static final long RECOVERY_INTERVAL_TICKS = 200L;
     private static final Map<Object, Map<NodeKey, WeakReference<Object>>> NODES = new WeakHashMap<>();
+    private static final Map<Object, Map<NodeKey, NodeKey>> LAST_KNOWN_PARENTS = new WeakHashMap<>();
+    private static final Map<Object, Long> VALIDATION_DUE = new WeakHashMap<>();
     private static final Map<Object, Long> NEXT_RECOVERY = new WeakHashMap<>();
     private static final Map<Object, Boolean> BROKEN_LOGGED = new WeakHashMap<>();
+    private static final Map<Object, Boolean> VALIDATED_ON_LOAD = new WeakHashMap<>();
 
     private VisRelayChunkLoader() {
     }
@@ -49,8 +56,14 @@ public final class VisRelayChunkLoader {
             for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
                 int chunkX = centerChunkX + offsetX;
                 int chunkZ = centerChunkZ + offsetZ;
+                Object chunk;
                 if (!invokeBoolean(provider, new String[]{"chunkExists", "func_73149_a"}, chunkX, chunkZ)) {
-                    invoke(provider, new String[]{"loadChunk", "func_73158_c"}, chunkX, chunkZ);
+                    chunk = invoke(provider, new String[]{"loadChunk", "func_73158_c"}, chunkX, chunkZ);
+                } else {
+                    chunk = invoke(provider, new String[]{"provideChunk", "func_73154_d"}, chunkX, chunkZ);
+                }
+                if (chunk != null) {
+                    registerNodesInChunk(world, chunk);
                 }
             }
         }
@@ -67,6 +80,75 @@ public final class VisRelayChunkLoader {
         }
 
         register(world, node);
+        rememberCurrentParent(world, node);
+    }
+
+    /**
+     * Runs from TileVisNode.updateEntity. A live direct parent is not enough:
+     * every relay in its parent chain must eventually reach a source node.
+     */
+    public static void validateExistingConnection(Object node) {
+        if (node == null || isInvalid(node)) {
+            return;
+        }
+
+        Object world = readValue(node, "worldObj", "field_145850_b", "getWorldObj()", "func_145831_w()");
+        if (world == null || readBoolean(world, "isRemote", "field_72995_K")) {
+            return;
+        }
+
+        register(world, node);
+        rememberCurrentParent(world, node);
+        if (isSource(node) || !shouldValidateOnLoad(node, world)) {
+            return;
+        }
+
+        if (isConnected(node)) {
+            logFixedIfPreviouslyBroken(world, node, getReference(node, "getParent()"));
+            return;
+        }
+
+        Object repairTarget = findDisconnectedAncestor(node);
+        if (repairTarget == null) {
+            if (markBrokenIfNeeded(node)) {
+                logBroken(world, node);
+            }
+            return;
+        }
+
+        repairDisconnectedNode(world, repairTarget);
+    }
+
+    private static void repairDisconnectedNode(Object world, Object node) {
+        if (isConnected(node)) {
+            logFixedIfPreviouslyBroken(world, node, getReference(node, "getParent()"));
+            return;
+        }
+
+        if (markBrokenIfNeeded(node)) {
+            logBroken(world, node);
+        }
+
+        // Repair the first broken edge rather than rerouting a healthy child
+        // farther down the chain. This keeps branching relay layouts stable.
+        ensureNearbyChunksLoaded(node);
+
+        WeakReference<Object> oldParent = getReference(node, "getParent()");
+        WeakReference<Object> recovered = findAndLinkNearbyNode(world, node, oldParent);
+        if (isConnectedReference(recovered) && setParent(node, recovered)) {
+            removeChildReference(oldParent, node);
+            rememberParent(world, node, recovered);
+            notifyParentChanged(world, node);
+            logFixedIfPreviouslyBroken(world, node, recovered);
+            return;
+        }
+
+        // Keep a live but disconnected parent in place while the local area
+        // settles. Clearing it would make Thaumcraft redraw the relay every
+        // forty ticks even though no better route has appeared yet.
+        if (!isValidReference(oldParent)) {
+            setNodeRefresh(node);
+        }
     }
 
     public static WeakReference<Object> recoverIfDisconnected(WeakReference<Object> originalParent, Object node) {
@@ -80,10 +162,18 @@ public final class VisRelayChunkLoader {
         }
 
         register(world, node);
-        if (isValidReference(originalParent)) {
-            synchronized (NODES) {
-                BROKEN_LOGGED.remove(node);
-            }
+        WeakReference<Object> rememberedParent = findRememberedParent(world, node);
+        if (canUseAsParent(node, rememberedParent)) {
+            removeChildReference(originalParent, node);
+            linkChild(rememberedParent.get(), node);
+            rememberParent(world, node, rememberedParent);
+            logFixedIfPreviouslyBroken(world, node, rememberedParent);
+            return rememberedParent;
+        }
+
+        if (isConnectedReference(originalParent)) {
+            rememberParent(world, node, originalParent);
+            logFixedIfPreviouslyBroken(world, node, originalParent);
             return originalParent;
         }
 
@@ -98,15 +188,15 @@ public final class VisRelayChunkLoader {
             }
         }
 
+        if (markBrokenIfNeeded(node)) {
+            logBroken(world, node);
+        }
+
         WeakReference<Object> recovered = findAndLinkNearbyNode(world, node, originalParent);
-        if (isValidReference(recovered)) {
-            Object parent = recovered.get();
-            synchronized (NODES) {
-                BROKEN_LOGGED.remove(node);
-            }
-            logFixed(world, node, parent);
-        } else {
-            logBrokenIfNeeded(world, node);
+        if (isConnectedReference(recovered)) {
+            removeChildReference(originalParent, node);
+            rememberParent(world, node, recovered);
+            logFixedIfPreviouslyBroken(world, node, recovered);
         }
         return recovered;
     }
@@ -129,6 +219,20 @@ public final class VisRelayChunkLoader {
                     new NodeKey(((Number) xValue).intValue(), ((Number) yValue).intValue(), ((Number) zValue).intValue()),
                     new WeakReference<>(node)
             );
+        }
+    }
+
+    private static void registerNodesInChunk(Object world, Object chunk) {
+        Object tileEntities = readValue(chunk, "chunkTileEntityMap", "field_150816_i");
+        if (!(tileEntities instanceof Map)) {
+            return;
+        }
+
+        for (Object tileEntity : ((Map<?, ?>) tileEntities).values()) {
+            if (isVisNode(tileEntity)) {
+                register(world, tileEntity);
+                rememberCurrentParent(world, tileEntity);
+            }
         }
     }
 
@@ -165,7 +269,7 @@ public final class VisRelayChunkLoader {
                     iterator.remove();
                     continue;
                 }
-                if (candidate == node || !isConnected(candidate)) {
+                if (candidate == node || !isConnected(candidate) || wouldCreateCycle(node, candidate)) {
                     continue;
                 }
 
@@ -217,12 +321,151 @@ public final class VisRelayChunkLoader {
     }
 
     private static boolean isConnected(Object node) {
-        Object source = invokeNoArgs(node, "isSource()");
-        if (source instanceof Boolean && (Boolean) source) {
-            return true;
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Object current = node;
+        for (int depth = 0; depth < 512 && current != null; depth++) {
+            if (!visited.add(current)) {
+                return false;
+            }
+            if (!isLiveNode(current)) {
+                return false;
+            }
+
+            if (isSource(current)) {
+                return true;
+            }
+
+            Object parent = invokeNoArgs(current, "getParent()");
+            if (!isValidReference(parent)) {
+                return false;
+            }
+            current = ((WeakReference<?>) parent).get();
         }
-        Object parent = invokeNoArgs(node, "getParent()");
-        return isValidReference(parent);
+        return false;
+    }
+
+    private static boolean isConnectedReference(Object reference) {
+        return isValidReference(reference) && isConnected(((WeakReference<?>) reference).get());
+    }
+
+    private static void rememberCurrentParent(Object world, Object node) {
+        rememberParent(world, node, getReference(node, "getParent()"));
+    }
+
+    private static void rememberParent(Object world, Object node, WeakReference<Object> parentReference) {
+        if (!isConnectedReference(parentReference)) {
+            return;
+        }
+
+        NodeKey nodeKey = getNodeKey(node);
+        NodeKey parentKey = getNodeKey(parentReference.get());
+        if (nodeKey == null || parentKey == null) {
+            return;
+        }
+
+        synchronized (NODES) {
+            Map<NodeKey, NodeKey> worldParents = LAST_KNOWN_PARENTS.get(world);
+            if (worldParents == null) {
+                worldParents = new HashMap<>();
+                LAST_KNOWN_PARENTS.put(world, worldParents);
+            }
+            worldParents.put(nodeKey, parentKey);
+        }
+    }
+
+    private static WeakReference<Object> findRememberedParent(Object world, Object node) {
+        NodeKey nodeKey = getNodeKey(node);
+        if (nodeKey == null) {
+            return null;
+        }
+
+        synchronized (NODES) {
+            Map<NodeKey, NodeKey> worldParents = LAST_KNOWN_PARENTS.get(world);
+            Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(world);
+            if (worldParents == null || worldNodes == null) {
+                return null;
+            }
+
+            NodeKey parentKey = worldParents.get(nodeKey);
+            WeakReference<Object> parent = parentKey == null ? null : worldNodes.get(parentKey);
+            return isConnectedReference(parent) ? parent : null;
+        }
+    }
+
+    private static boolean canUseAsParent(Object node, WeakReference<Object> parentReference) {
+        if (!isConnectedReference(parentReference)) {
+            return false;
+        }
+
+        Object parent = parentReference.get();
+        if (parent == node || wouldCreateCycle(node, parent)) {
+            return false;
+        }
+
+        NodeKey nodeKey = getNodeKey(node);
+        NodeKey parentKey = getNodeKey(parent);
+        Object rangeValue = readValue(node, "getRange()");
+        Object attunementValue = readValue(node, "getAttunement()");
+        Object parentAttunementValue = readValue(parent, "getAttunement()");
+        if (nodeKey == null || parentKey == null || !(rangeValue instanceof Number)
+                || !(attunementValue instanceof Number) || !(parentAttunementValue instanceof Number)) {
+            return false;
+        }
+
+        long dx = (long) parentKey.x - nodeKey.x;
+        long dy = (long) parentKey.y - nodeKey.y;
+        long dz = (long) parentKey.z - nodeKey.z;
+        long range = ((Number) rangeValue).longValue();
+        if (dx * dx + dy * dy + dz * dz > range * range) {
+            return false;
+        }
+
+        int attunement = ((Number) attunementValue).intValue();
+        int parentAttunement = ((Number) parentAttunementValue).intValue();
+        return (attunement == -1 || parentAttunement == -1 || attunement == parentAttunement)
+                && canNodeBeSeen(node, parent);
+    }
+
+    /**
+     * Finds the first upstream relay without a live parent. Repairing that
+     * relay restores its entire child branch and avoids side-linking siblings.
+     * A fully live cycle has no safe automatic repair point.
+     */
+    private static Object findDisconnectedAncestor(Object node) {
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Object current = node;
+        for (int depth = 0; depth < 512 && current != null; depth++) {
+            if (!visited.add(current) || isSource(current)) {
+                return null;
+            }
+
+            Object parent = invokeNoArgs(current, "getParent()");
+            if (!isValidReference(parent)) {
+                return current;
+            }
+            current = ((WeakReference<?>) parent).get();
+        }
+        return null;
+    }
+
+    private static boolean wouldCreateCycle(Object node, Object candidate) {
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Object current = candidate;
+        for (int depth = 0; depth < 512 && current != null; depth++) {
+            if (current == node) {
+                return true;
+            }
+            if (!visited.add(current)) {
+                return true;
+            }
+
+            Object parent = invokeNoArgs(current, "getParent()");
+            if (!isValidReference(parent)) {
+                return false;
+            }
+            current = ((WeakReference<?>) parent).get();
+        }
+        return true;
     }
 
     private static boolean isValidReference(Object reference) {
@@ -230,12 +473,163 @@ public final class VisRelayChunkLoader {
             return false;
         }
         Object node = ((WeakReference<?>) reference).get();
-        return node != null && !isInvalid(node);
+        return node != null && isLiveNode(node);
     }
 
     private static boolean isInvalid(Object node) {
         Object invalid = readValue(node, "isInvalid()", "func_145837_r()");
         return invalid instanceof Boolean && (Boolean) invalid;
+    }
+
+    private static boolean isLiveNode(Object node) {
+        if (isInvalid(node)) {
+            return false;
+        }
+
+        Object world = readValue(node, "worldObj", "field_145850_b", "getWorldObj()", "func_145831_w()");
+        Object x = readValue(node, "xCoord", "field_145851_c");
+        Object z = readValue(node, "zCoord", "field_145849_e");
+        if (world == null || !(x instanceof Number) || !(z instanceof Number)) {
+            return true;
+        }
+
+        Object provider = invokeNoArgs(world, "getChunkProvider", "func_72863_F");
+        if (provider == null) {
+            return true;
+        }
+
+        Object loaded = invoke(
+                provider,
+                new String[]{"chunkExists", "func_73149_a"},
+                ((Number) x).intValue() >> 4,
+                ((Number) z).intValue() >> 4
+        );
+        return !(loaded instanceof Boolean) || (Boolean) loaded;
+    }
+
+    private static boolean isSource(Object node) {
+        Object source = invokeNoArgs(node, "isSource()");
+        return source instanceof Boolean && (Boolean) source;
+    }
+
+    private static boolean isVisNode(Object tileEntity) {
+        return tileEntity != null
+                && findMethod(tileEntity.getClass(), "isSource", 0) != null
+                && findMethod(tileEntity.getClass(), "getRange", 0) != null
+                && findMethod(tileEntity.getClass(), "getParent", 0) != null
+                && findMethod(tileEntity.getClass(), "getChildren", 0) != null;
+    }
+
+    private static boolean shouldValidateOnLoad(Object node, Object world) {
+        long worldTime = readWorldTime(world);
+        synchronized (NODES) {
+            if (VALIDATED_ON_LOAD.containsKey(node)) {
+                return false;
+            }
+            if (worldTime < 0L) {
+                VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
+                return true;
+            }
+
+            Long due = VALIDATION_DUE.get(node);
+            if (due == null) {
+                VALIDATION_DUE.put(node, worldTime + LOAD_SETTLE_TICKS);
+                return false;
+            }
+            if (worldTime < due) {
+                return false;
+            }
+
+            VALIDATION_DUE.remove(node);
+            VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
+            return true;
+        }
+    }
+
+    private static WeakReference<Object> getReference(Object node, String... names) {
+        Object reference = readValue(node, names);
+        return reference instanceof WeakReference ? (WeakReference<Object>) reference : null;
+    }
+
+    private static boolean setParent(Object node, WeakReference<Object> parent) {
+        try {
+            Method method = findMethod(node.getClass(), "setParent", 1);
+            if (method == null) {
+                return false;
+            }
+            method.setAccessible(true);
+            method.invoke(node, parent);
+            return true;
+        } catch (ReflectiveOperationException ignored) {
+            return false;
+        }
+    }
+
+    private static void removeChildReference(WeakReference<Object> parentReference, Object node) {
+        if (!isValidReference(parentReference)) {
+            return;
+        }
+
+        Object children = invokeNoArgs(parentReference.get(), "getChildren()");
+        if (!(children instanceof List)) {
+            return;
+        }
+
+        boolean removed = false;
+        for (java.util.Iterator<?> iterator = ((List<?>) children).iterator(); iterator.hasNext();) {
+            Object childReference = iterator.next();
+            if (childReference instanceof WeakReference && ((WeakReference<?>) childReference).get() == node) {
+                iterator.remove();
+                removed = true;
+            }
+        }
+        if (removed) {
+            clearNearbyNodeCache();
+        }
+    }
+
+    private static void linkChild(Object parent, Object node) {
+        Object children = invokeNoArgs(parent, "getChildren()");
+        if (!(children instanceof List)) {
+            return;
+        }
+
+        for (Object childReference : (List<?>) children) {
+            if (childReference instanceof WeakReference && ((WeakReference<?>) childReference).get() == node) {
+                return;
+            }
+        }
+        ((List<Object>) children).add(new WeakReference<>(node));
+        clearNearbyNodeCache();
+    }
+
+    private static void setNodeRefresh(Object node) {
+        try {
+            Field field = findField(node.getClass(), "nodeRefresh");
+            if (field != null) {
+                field.setAccessible(true);
+                field.setBoolean(node, true);
+            }
+        } catch (IllegalAccessException ignored) {
+            // Falling back to Thaumcraft's next normal connection attempt is safe.
+        }
+    }
+
+    private static void notifyParentChanged(Object world, Object node) {
+        invokeNoArgs(node, "parentChanged()");
+
+        Object x = readValue(node, "xCoord", "field_145851_c");
+        Object y = readValue(node, "yCoord", "field_145848_d");
+        Object z = readValue(node, "zCoord", "field_145849_e");
+        if (x instanceof Number && y instanceof Number && z instanceof Number) {
+            invokeWithArgs(
+                    world,
+                    new String[]{"markBlockForUpdate", "func_147479_m"},
+                    ((Number) x).intValue(),
+                    ((Number) y).intValue(),
+                    ((Number) z).intValue()
+            );
+        }
     }
 
     private static boolean canNodeBeSeen(Object source, Object target) {
@@ -270,19 +664,35 @@ public final class VisRelayChunkLoader {
     }
 
     private static long readWorldTime(Object world) {
-        Object value = readValue(world, "getTotalWorldTime()", "func_72820_D()");
+        Object value = readValue(world, "getTotalWorldTime()", "func_82737_E()", "func_72820_D()");
         return value instanceof Number ? ((Number) value).longValue() : -1L;
     }
 
-    private static void logBrokenIfNeeded(Object world, Object node) {
+    private static boolean markBrokenIfNeeded(Object node) {
         synchronized (NODES) {
-            if (BROKEN_LOGGED.put(node, Boolean.TRUE) != null) {
+            return BROKEN_LOGGED.put(node, Boolean.TRUE) == null;
+        }
+    }
+
+    private static void logFixedIfPreviouslyBroken(Object world, Object node, WeakReference<Object> parentReference) {
+        Object parent = isValidReference(parentReference) ? parentReference.get() : null;
+        if (parent == null) {
+            return;
+        }
+
+        synchronized (NODES) {
+            if (BROKEN_LOGGED.remove(node) == null) {
                 return;
             }
+            NEXT_RECOVERY.remove(node);
         }
+        logFixed(world, node, parent);
+    }
+
+    private static void logBroken(Object world, Object node) {
         logInfo(String.format(
-                "[VisRelayFix] Disconnected %s at %s; retrying recovery every %d ticks.",
-                nodeLabel(node), describeLocation(world, node), RECOVERY_INTERVAL_TICKS));
+                "[VisRelayFix] Broken parent chain for %s at %s; attempting repair.",
+                nodeLabel(node), describeLocation(world, node)));
     }
 
     private static void logFixed(Object world, Object node, Object parent) {
@@ -292,6 +702,9 @@ public final class VisRelayChunkLoader {
     }
 
     private static void logInfo(String message) {
+        if (!VisRelayFixConfig.isLoggingEnabled()) {
+            return;
+        }
         try {
             FMLLog.info(message);
         } catch (Throwable ignored) {
@@ -330,13 +743,20 @@ public final class VisRelayChunkLoader {
         for (String name : names) {
             try {
                 if (name.indexOf('(') >= 0) {
-                    return invokeNoArgs(target, name.substring(0, name.indexOf('(')));
+                    Object value = invokeNoArgs(target, name.substring(0, name.indexOf('(')));
+                    if (value != null) {
+                        return value;
+                    }
+                    continue;
                 }
 
                 Field field = findField(target.getClass(), name);
                 if (field != null) {
                     field.setAccessible(true);
-                    return field.get(target);
+                    Object value = field.get(target);
+                    if (value != null) {
+                        return value;
+                    }
                 }
             } catch (ReflectiveOperationException ignored) {
                 // Try the next deobfuscated/obfuscated name.
@@ -381,6 +801,21 @@ public final class VisRelayChunkLoader {
         return null;
     }
 
+    private static Object invokeWithArgs(Object target, String[] names, Object... arguments) {
+        for (String name : names) {
+            try {
+                Method method = findMethod(target.getClass(), name, arguments.length);
+                if (method != null) {
+                    method.setAccessible(true);
+                    return method.invoke(target, arguments);
+                }
+            } catch (ReflectiveOperationException ignored) {
+                // Try the next deobfuscated/obfuscated name.
+            }
+        }
+        return null;
+    }
+
     private static Field findField(Class<?> type, String name) {
         for (Class<?> current = type; current != null; current = current.getSuperclass()) {
             try {
@@ -401,6 +836,20 @@ public final class VisRelayChunkLoader {
             }
         }
         return null;
+    }
+
+    private static NodeKey getNodeKey(Object node) {
+        Object x = readValue(node, "xCoord", "field_145851_c");
+        Object y = readValue(node, "yCoord", "field_145848_d");
+        Object z = readValue(node, "zCoord", "field_145849_e");
+        if (!(x instanceof Number) || !(y instanceof Number) || !(z instanceof Number)) {
+            return null;
+        }
+        return new NodeKey(
+                ((Number) x).intValue(),
+                ((Number) y).intValue(),
+                ((Number) z).intValue()
+        );
     }
 
     private static final class NodeKey {

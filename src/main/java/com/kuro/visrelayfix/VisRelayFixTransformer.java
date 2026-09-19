@@ -40,7 +40,23 @@ public final class VisRelayFixTransformer implements IClassTransformer {
         @Override
         public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
             MethodVisitor delegate = super.visitMethod(access, name, descriptor, signature, exceptions);
+            final boolean isNodeUpdate = "updateEntity".equals(name) && "()V".equals(descriptor);
             return new MethodVisitor(Opcodes.ASM4, delegate) {
+                @Override
+                public void visitCode() {
+                    super.visitCode();
+                    if (isNodeUpdate) {
+                        visitVarInsn(Opcodes.ALOAD, 0);
+                        visitMethodInsn(
+                                Opcodes.INVOKESTATIC,
+                                HELPER_OWNER,
+                                "validateExistingConnection",
+                                "(Ljava/lang/Object;)V"
+                        );
+                        patched = true;
+                    }
+                }
+
                 @Override
                 public void visitMethodInsn(int opcode, String owner, String methodName, String methodDescriptor) {
                     if (opcode == Opcodes.INVOKESTATIC && TARGET_OWNER.equals(owner)

@@ -1,0 +1,12 @@
+# Maven build output
+/target/
+
+# IntelliJ IDEA project files
+/.idea/
+*.iml
+
+# Local game/runtime files
+/config/
+/logs/
+/crash-reports/
+*.log
