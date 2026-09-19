@@ -267,6 +267,42 @@ public class VisRelayFixTest {
         assertSame(third, second.children.get(0).get());
     }
 
+    @Test
+    public void verticalReloadWaitsForCurrentRelayInstancesBeforeRestoring() {
+        FakeWorld world = new FakeWorld();
+        FakeNode oldSource = new FakeNode(world, 0, 64, 0, true);
+        FakeNode oldFirst = new FakeNode(world, 0, 70, 0, false);
+        FakeNode oldSecond = new FakeNode(world, 0, 76, 0, false);
+        FakeNode oldThird = new FakeNode(world, 0, 82, 0, false);
+        connect(oldSource, oldFirst);
+        connect(oldFirst, oldSecond);
+        connect(oldSecond, oldThird);
+
+        VisRelayChunkLoader.registerNode(oldSource);
+        VisRelayChunkLoader.validateExistingConnection(oldFirst);
+        VisRelayChunkLoader.validateExistingConnection(oldSecond);
+        VisRelayChunkLoader.validateExistingConnection(oldThird);
+
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode first = new FakeNode(world, 0, 70, 0, false);
+        FakeNode second = new FakeNode(world, 0, 76, 0, false);
+        FakeNode third = new FakeNode(world, 0, 82, 0, false);
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(third);
+
+        VisRelayChunkLoader.validateExistingConnection(third);
+        assertNull(third.getParent());
+        assertTrue(third.nodeRefresh);
+
+        VisRelayChunkLoader.registerNode(first);
+        VisRelayChunkLoader.registerNode(second);
+        VisRelayChunkLoader.validateExistingConnection(third);
+
+        assertSame(source, first.getParent().get());
+        assertSame(first, second.getParent().get());
+        assertSame(second, third.getParent().get());
+    }
+
     private static void connect(FakeNode parent, FakeNode child) {
         child.setParent(new WeakReference<>(parent));
         parent.children.add(new WeakReference<>(child));
@@ -275,9 +311,18 @@ public class VisRelayFixTest {
     public static class FakeWorld {
         public boolean isRemote;
         public final FakeChunkProvider chunkProvider = new FakeChunkProvider();
+        private final java.util.Map<String, FakeNode> tileEntities = new java.util.HashMap<>();
 
         public FakeChunkProvider getChunkProvider() {
             return chunkProvider;
+        }
+
+        public FakeNode getTileEntity(int x, int y, int z) {
+            return tileEntities.get(x + ":" + y + ":" + z);
+        }
+
+        private void setTileEntity(FakeNode node) {
+            tileEntities.put(node.xCoord + ":" + node.yCoord + ":" + node.zCoord, node);
         }
     }
 
@@ -322,6 +367,7 @@ public class VisRelayFixTest {
             this.yCoord = y;
             this.zCoord = z;
             this.source = source;
+            world.setTileEntity(this);
         }
 
         public boolean isInvalid() {

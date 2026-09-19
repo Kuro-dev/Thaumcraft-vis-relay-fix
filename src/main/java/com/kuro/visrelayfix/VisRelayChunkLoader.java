@@ -533,8 +533,9 @@ public final class VisRelayChunkLoader {
 
         Object world = readValue(node, "worldObj", "field_145850_b", "getWorldObj()", "func_145831_w()");
         Object x = readValue(node, "xCoord", "field_145851_c");
+        Object y = readValue(node, "yCoord", "field_145848_d");
         Object z = readValue(node, "zCoord", "field_145849_e");
-        if (world == null || !(x instanceof Number) || !(z instanceof Number)) {
+        if (world == null || !(x instanceof Number) || !(y instanceof Number) || !(z instanceof Number)) {
             return true;
         }
 
@@ -549,7 +550,34 @@ public final class VisRelayChunkLoader {
                 ((Number) x).intValue() >> 4,
                 ((Number) z).intValue() >> 4
         );
-        return !(loaded instanceof Boolean) || (Boolean) loaded;
+        if (loaded instanceof Boolean && !(Boolean) loaded) {
+            return false;
+        }
+
+        // A chunk can be loaded while its registry entry still points at the
+        // TileEntity instance from before that chunk was unloaded. Linking to
+        // that stale instance loses the branch after a reload, most visibly
+        // with vertical relay runs that all share one chunk.
+        Method getTileEntity = findMethod(world.getClass(), "getTileEntity", 3);
+        if (getTileEntity == null) {
+            getTileEntity = findMethod(world.getClass(), "func_147438_o", 3);
+        }
+        if (getTileEntity == null) {
+            return true;
+        }
+
+        try {
+            getTileEntity.setAccessible(true);
+            return getTileEntity.invoke(
+                    world,
+                    ((Number) x).intValue(),
+                    ((Number) y).intValue(),
+                    ((Number) z).intValue()
+            ) == node;
+        } catch (ReflectiveOperationException ignored) {
+            // The chunk check above remains a safe fallback on unusual worlds.
+            return true;
+        }
     }
 
     private static boolean isSource(Object node) {
