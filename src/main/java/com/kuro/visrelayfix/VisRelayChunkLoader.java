@@ -103,7 +103,7 @@ public final class VisRelayChunkLoader {
             return;
         }
 
-        if (isConnected(node)) {
+        if (restoreRememberedParentChain(world, node) || isConnected(node)) {
             logFixedIfPreviouslyBroken(world, node, getReference(node, "getParent()"));
             return;
         }
@@ -113,10 +113,14 @@ public final class VisRelayChunkLoader {
             if (markBrokenIfNeeded(node)) {
                 logBroken(world, node);
             }
+            scheduleValidationRetry(node, world);
             return;
         }
 
         repairDisconnectedNode(world, repairTarget);
+        if (!isConnected(node)) {
+            scheduleValidationRetry(node, world);
+        }
     }
 
     private static void repairDisconnectedNode(Object world, Object node) {
@@ -388,8 +392,49 @@ public final class VisRelayChunkLoader {
 
             NodeKey parentKey = worldParents.get(nodeKey);
             WeakReference<Object> parent = parentKey == null ? null : worldNodes.get(parentKey);
-            return isConnectedReference(parent) ? parent : null;
+            return isValidReference(parent) ? parent : null;
         }
+    }
+
+    /**
+     * Rebuilds a remembered relay branch from its rooted parent outward. This
+     * lets a whole loaded branch recover in one validation pass instead of
+     * relying on the order in which TileEntities happen to tick after reload.
+     */
+    private static boolean restoreRememberedParentChain(Object world, Object node) {
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        return restoreRememberedParentChain(world, node, visited);
+    }
+
+    private static boolean restoreRememberedParentChain(Object world, Object node, Set<Object> visited) {
+        if (isConnected(node)) {
+            return true;
+        }
+        if (!visited.add(node)) {
+            return false;
+        }
+
+        WeakReference<Object> parentReference = findRememberedParent(world, node);
+        if (parentReference == null) {
+            return false;
+        }
+
+        Object parent = parentReference.get();
+        if (!restoreRememberedParentChain(world, parent, visited)
+                || !canUseAsParent(node, parentReference)) {
+            return false;
+        }
+
+        WeakReference<Object> oldParent = getReference(node, "getParent()");
+        if (!setParent(node, parentReference)) {
+            return false;
+        }
+        removeChildReference(oldParent, node);
+        linkChild(parent, node);
+        rememberParent(world, node, parentReference);
+        notifyParentChanged(world, node);
+        logFixedIfPreviouslyBroken(world, node, parentReference);
+        return true;
     }
 
     private static boolean canUseAsParent(Object node, WeakReference<Object> parentReference) {
@@ -543,6 +588,16 @@ public final class VisRelayChunkLoader {
             VALIDATION_DUE.remove(node);
             VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
             return true;
+        }
+    }
+
+    private static void scheduleValidationRetry(Object node, Object world) {
+        long worldTime = readWorldTime(world);
+        synchronized (NODES) {
+            VALIDATED_ON_LOAD.remove(node);
+            if (worldTime >= 0L) {
+                VALIDATION_DUE.put(node, worldTime + LOAD_SETTLE_TICKS);
+            }
         }
     }
 
