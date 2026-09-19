@@ -24,6 +24,7 @@ public final class VisRelayChunkLoader {
     private static final Map<Object, Long> NEXT_RECOVERY = new WeakHashMap<>();
     private static final Map<Object, Boolean> BROKEN_LOGGED = new WeakHashMap<>();
     private static final Map<Object, Boolean> VALIDATED_ON_LOAD = new WeakHashMap<>();
+    private static final Map<Object, Boolean> OBSERVED_NODES = new WeakHashMap<>();
     private static final Map<Object, Long> NEXT_STATE_CLEANUP = new WeakHashMap<>();
 
     private VisRelayChunkLoader() {
@@ -91,7 +92,10 @@ public final class VisRelayChunkLoader {
      * every relay in its parent chain must eventually reach a source node.
      */
     public static void validateExistingConnection(Object node) {
-        if (node == null || isInvalid(node)) {
+        if (node == null || isValidationComplete(node)) {
+            return;
+        }
+        if (isInvalid(node)) {
             return;
         }
 
@@ -100,11 +104,20 @@ public final class VisRelayChunkLoader {
             return;
         }
 
-        register(world, node);
-        rememberCurrentParent(world, node);
-        if (isSource(node) || !shouldValidateOnLoad(node, world)) {
+        if (markNodeObserved(node)) {
+            register(world, node);
+            rememberCurrentParent(world, node);
+        }
+
+        if (isSource(node)) {
+            markValidationComplete(node);
             return;
         }
+        if (!shouldValidateOnLoad(node, world)) {
+            return;
+        }
+
+        rememberCurrentParent(world, node);
 
         if (restoreRememberedParentChain(world, node) || isConnected(node)) {
             logFixedIfPreviouslyBroken(world, node, getReference(node, "getParent()"));
@@ -148,6 +161,24 @@ public final class VisRelayChunkLoader {
             notifyParentChanged(world, node);
             logFixedIfPreviouslyBroken(world, node, recovered);
             return;
+        }
+
+        // When an entire relay branch has lost its parents, there is no
+        // connected relay for the normal search to grow from. Root the nearest
+        // valid relay beside a source, then retry this relay against that new
+        // energized branch.
+        if (bootstrapRelayFromSource(world)) {
+            if (isConnected(node)) {
+                return;
+            }
+            recovered = findAndLinkNearbyNode(world, node, oldParent);
+            if (isConnectedReference(recovered) && setParent(node, recovered)) {
+                removeChildReference(oldParent, node);
+                rememberParent(world, node, recovered);
+                notifyParentChanged(world, node);
+                logFixedIfPreviouslyBroken(world, node, recovered);
+                return;
+            }
         }
 
         // Keep a live but disconnected parent in place while the local area
@@ -200,6 +231,12 @@ public final class VisRelayChunkLoader {
         }
 
         WeakReference<Object> recovered = findAndLinkNearbyNode(world, node, originalParent);
+        if (!isConnectedReference(recovered) && bootstrapRelayFromSource(world)) {
+            if (isConnected(node)) {
+                return getReference(node, "getParent()");
+            }
+            recovered = findAndLinkNearbyNode(world, node, originalParent);
+        }
         if (isConnectedReference(recovered)) {
             removeChildReference(originalParent, node);
             rememberParent(world, node, recovered);
@@ -326,6 +363,101 @@ public final class VisRelayChunkLoader {
             clearNearbyNodeCache();
             return new WeakReference<>(closest);
         }
+    }
+
+    /**
+     * Restarts a fully disconnected relay branch from the source outward. The
+     * normal recovery path deliberately ignores unrooted relays; this picks
+     * one deterministic, visible source-to-relay edge to become the new root.
+     */
+    private static boolean bootstrapRelayFromSource(Object world) {
+        Object closestRelay = null;
+        Object closestSource = null;
+        NodeKey closestRelayKey = null;
+        NodeKey closestSourceKey = null;
+        long closestDistance = Long.MAX_VALUE;
+
+        synchronized (NODES) {
+            Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(world);
+            if (worldNodes == null) {
+                return false;
+            }
+
+            for (Map.Entry<NodeKey, WeakReference<Object>> relayEntry : worldNodes.entrySet()) {
+                Object relay = relayEntry.getValue().get();
+                if (relay == null || isInvalid(relay) || isSource(relay) || isConnected(relay)) {
+                    continue;
+                }
+
+                for (Map.Entry<NodeKey, WeakReference<Object>> sourceEntry : worldNodes.entrySet()) {
+                    Object source = sourceEntry.getValue().get();
+                    if (source == null || !isSource(source)
+                            || !canUseAsParent(relay, new WeakReference<>(source))) {
+                        continue;
+                    }
+
+                    long distance = squaredDistance(relayEntry.getKey(), sourceEntry.getKey());
+                    if (distance < closestDistance
+                            || distance == closestDistance && isEarlierPair(
+                            relayEntry.getKey(), sourceEntry.getKey(), closestRelayKey, closestSourceKey)) {
+                        closestRelay = relay;
+                        closestSource = source;
+                        closestRelayKey = relayEntry.getKey();
+                        closestSourceKey = sourceEntry.getKey();
+                        closestDistance = distance;
+                    }
+                }
+            }
+        }
+
+        if (closestRelay == null || closestSource == null) {
+            return false;
+        }
+
+        WeakReference<Object> sourceReference = new WeakReference<>(closestSource);
+        WeakReference<Object> oldParent = getReference(closestRelay, "getParent()");
+        if (!setParent(closestRelay, sourceReference)) {
+            return false;
+        }
+
+        if (markBrokenIfNeeded(closestRelay)) {
+            logBroken(world, closestRelay);
+        }
+        removeChildReference(oldParent, closestRelay);
+        linkChild(closestSource, closestRelay);
+        rememberParent(world, closestRelay, sourceReference);
+        notifyParentChanged(world, closestRelay);
+        logFixedIfPreviouslyBroken(world, closestRelay, sourceReference);
+        return true;
+    }
+
+    private static long squaredDistance(NodeKey first, NodeKey second) {
+        long dx = (long) first.x - second.x;
+        long dy = (long) first.y - second.y;
+        long dz = (long) first.z - second.z;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static boolean isEarlierPair(NodeKey relay, NodeKey source, NodeKey currentRelay, NodeKey currentSource) {
+        if (currentRelay == null || currentSource == null) {
+            return true;
+        }
+
+        int relayComparison = compareNodeKeys(relay, currentRelay);
+        return relayComparison < 0 || relayComparison == 0 && compareNodeKeys(source, currentSource) < 0;
+    }
+
+    private static int compareNodeKeys(NodeKey first, NodeKey second) {
+        if (first.x != second.x) {
+            return first.x < second.x ? -1 : 1;
+        }
+        if (first.y != second.y) {
+            return first.y < second.y ? -1 : 1;
+        }
+        if (first.z == second.z) {
+            return 0;
+        }
+        return first.z < second.z ? -1 : 1;
     }
 
     private static boolean isConnected(Object node) {
@@ -671,6 +803,25 @@ public final class VisRelayChunkLoader {
             VALIDATION_DUE.remove(node);
             VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
             return true;
+        }
+    }
+
+    private static boolean isValidationComplete(Object node) {
+        synchronized (NODES) {
+            return VALIDATED_ON_LOAD.containsKey(node);
+        }
+    }
+
+    private static boolean markNodeObserved(Object node) {
+        synchronized (NODES) {
+            return OBSERVED_NODES.put(node, Boolean.TRUE) == null;
+        }
+    }
+
+    private static void markValidationComplete(Object node) {
+        synchronized (NODES) {
+            VALIDATION_DUE.remove(node);
+            VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
         }
     }
 

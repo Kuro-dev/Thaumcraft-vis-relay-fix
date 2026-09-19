@@ -141,6 +141,26 @@ public class VisRelayFixTest {
     }
 
     @Test
+    public void fullyDisconnectedBranchBootstrapsFromNearestSourceRelay() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode firstRelay = new FakeNode(world, 0, 70, 0, false);
+        FakeNode downstreamRelay = new FakeNode(world, 0, 76, 0, false);
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(firstRelay);
+        VisRelayChunkLoader.registerNode(downstreamRelay);
+        VisRelayChunkLoader.validateExistingConnection(downstreamRelay);
+
+        assertSame(source, firstRelay.getParent().get());
+        assertSame(firstRelay, downstreamRelay.getParent().get());
+        assertEquals(1, source.children.size());
+        assertSame(firstRelay, source.children.get(0).get());
+        assertEquals(1, firstRelay.children.size());
+        assertSame(downstreamRelay, firstRelay.children.get(0).get());
+    }
+
+    @Test
     public void refreshRestoresRememberedParentInsteadOfNearbySibling() {
         FakeWorld world = new FakeWorld();
         FakeNode source = new FakeNode(world, 0, 64, 0, true);
@@ -215,6 +235,25 @@ public class VisRelayFixTest {
         world.totalWorldTime = 40L;
         VisRelayChunkLoader.validateExistingConnection(target);
         assertTrue(target.nodeRefresh);
+    }
+
+    @Test
+    public void healthyRelayValidationBecomesQuiescentAfterLoadCheck() {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode relay = new FakeNode(world, 5, 64, 0, false);
+        connect(source, relay);
+
+        VisRelayChunkLoader.validateExistingConnection(relay);
+        world.totalWorldTime = 40L;
+        VisRelayChunkLoader.validateExistingConnection(relay);
+        relay.resetParentAccesses();
+
+        for (int tick = 0; tick < 100; tick++) {
+            VisRelayChunkLoader.validateExistingConnection(relay);
+        }
+
+        assertEquals(0, relay.parentAccesses);
     }
 
     @Test
@@ -476,6 +515,7 @@ public class VisRelayFixTest {
         public final int zCoord;
         public final List<WeakReference<FakeNode>> children = new ArrayList<>();
         public boolean nodeRefresh;
+        public int parentAccesses;
         private final boolean source;
         private WeakReference<FakeNode> parent;
 
@@ -497,7 +537,12 @@ public class VisRelayFixTest {
         }
 
         public WeakReference<FakeNode> getParent() {
+            parentAccesses++;
             return parent;
+        }
+
+        public void resetParentAccesses() {
+            parentAccesses = 0;
         }
 
         public void setParent(WeakReference<FakeNode> parent) {
