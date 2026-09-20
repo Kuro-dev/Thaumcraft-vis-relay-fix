@@ -16,13 +16,14 @@ import java.util.WeakHashMap;
 public final class VisRelayChunkLoader {
     private static final long LOAD_SETTLE_TICKS = 40L;
     private static final long RECOVERY_INTERVAL_TICKS = 200L;
+    private static final long REBUILD_WAIT_LOG_INTERVAL_TICKS = 200L;
     private static final long STATE_CLEANUP_INTERVAL_TICKS = 1_200L;
     private static final long REMEMBERED_PARENT_RETENTION_TICKS = 432_000L;
     private static final Map<Object, Map<NodeKey, WeakReference<Object>>> NODES = new WeakHashMap<>();
     private static final Map<Object, Map<NodeKey, RememberedParent>> LAST_KNOWN_PARENTS = new WeakHashMap<>();
     private static final Map<Object, Long> VALIDATION_DUE = new WeakHashMap<>();
     private static final Map<Object, Long> NEXT_RECOVERY = new WeakHashMap<>();
-    private static final Map<Object, Boolean> BROKEN_LOGGED = new WeakHashMap<>();
+    private static final Map<Object, RebuildLogState> REBUILD_LOGS = new WeakHashMap<>();
     private static final Map<Object, Boolean> VALIDATED_ON_LOAD = new WeakHashMap<>();
     private static final Map<Object, Boolean> OBSERVED_NODES = new WeakHashMap<>();
     private static final Map<Object, Long> NEXT_STATE_CLEANUP = new WeakHashMap<>();
@@ -91,52 +92,56 @@ public final class VisRelayChunkLoader {
      * Runs from TileVisNode.updateEntity. A live direct parent is not enough:
      * every relay in its parent chain must eventually reach a source node.
      */
-    public static void validateExistingConnection(Object node) {
+    /**
+     * @return true once this TileVisNode can skip all further validation until
+     *         its chunk creates a fresh TileEntity instance on the next load.
+     */
+    public static boolean validateExistingConnection(Object node) {
         if (node == null || isValidationComplete(node)) {
-            return;
+            return true;
         }
         if (isInvalid(node)) {
-            return;
+            return true;
         }
 
         Object world = readValue(node, "worldObj", "field_145850_b", "getWorldObj()", "func_145831_w()");
         if (world == null || readBoolean(world, "isRemote", "field_72995_K")) {
-            return;
+            return true;
         }
 
-        if (markNodeObserved(node)) {
-            register(world, node);
-            rememberCurrentParent(world, node);
-        }
+        prepareNodeForReload(world, node);
 
         if (isSource(node)) {
             markValidationComplete(node);
-            return;
+            return true;
         }
         if (!shouldValidateOnLoad(node, world)) {
-            return;
+            return false;
         }
 
         rememberCurrentParent(world, node);
 
-        if (restoreRememberedParentChain(world, node) || isConnected(node)) {
+        if (isConnected(node)) {
             logFixedIfPreviouslyBroken(world, node, getReference(node, "getParent()"));
-            return;
+            logRebuildResult(world, node, true);
+            return true;
         }
 
         Object repairTarget = findDisconnectedAncestor(node);
         if (repairTarget == null) {
-            if (markBrokenIfNeeded(node)) {
-                logBroken(world, node);
-            }
+            logRebuildResult(world, node, false);
             scheduleValidationRetry(node, world);
-            return;
+            return false;
         }
 
         repairDisconnectedNode(world, repairTarget);
         if (!isConnected(node)) {
+            logRebuildResult(world, node, false);
             scheduleValidationRetry(node, world);
+            return false;
         }
+        logRebuildResult(world, node, true);
+        return true;
     }
 
     private static void repairDisconnectedNode(Object world, Object node) {
@@ -145,48 +150,90 @@ public final class VisRelayChunkLoader {
             return;
         }
 
-        if (markBrokenIfNeeded(node)) {
-            logBroken(world, node);
-        }
-
-        // Repair the first broken edge rather than rerouting a healthy child
-        // farther down the chain. This keeps branching relay layouts stable.
+        // Every relay edge was cleared during load. Start from this settled
+        // relay, then grow an energized graph through its loaded neighbours.
         ensureNearbyChunksLoaded(node);
 
         WeakReference<Object> oldParent = getReference(node, "getParent()");
         WeakReference<Object> recovered = findAndLinkNearbyNode(world, node, oldParent);
-        if (isConnectedReference(recovered) && setParent(node, recovered)) {
-            removeChildReference(oldParent, node);
-            rememberParent(world, node, recovered);
-            notifyParentChanged(world, node);
-            logFixedIfPreviouslyBroken(world, node, recovered);
-            return;
-        }
+        boolean linked = linkRecoveredParent(world, node, oldParent, recovered);
 
-        // When an entire relay branch has lost its parents, there is no
-        // connected relay for the normal search to grow from. Root the nearest
-        // valid relay beside a source, then retry this relay against that new
-        // energized branch.
-        if (bootstrapRelayFromSource(world)) {
+        // A reload deliberately clears every relay edge. Once any relay has
+        // reached a source, expand that energized network through every
+        // compatible loaded relay now instead of making a long chain wait one
+        // extra settle window per hop.
+        if (rebuildEnergizedRelayGrid(world)) {
             if (isConnected(node)) {
                 return;
             }
+
+            oldParent = getReference(node, "getParent()");
             recovered = findAndLinkNearbyNode(world, node, oldParent);
-            if (isConnectedReference(recovered) && setParent(node, recovered)) {
-                removeChildReference(oldParent, node);
-                rememberParent(world, node, recovered);
-                notifyParentChanged(world, node);
-                logFixedIfPreviouslyBroken(world, node, recovered);
+            if (linkRecoveredParent(world, node, oldParent, recovered)) {
                 return;
             }
         }
 
-        // Keep a live but disconnected parent in place while the local area
-        // settles. Clearing it would make Thaumcraft redraw the relay every
-        // forty ticks even though no better route has appeared yet.
-        if (!isValidReference(oldParent)) {
-            setNodeRefresh(node);
+        if (linked || isConnected(node)) {
+            return;
         }
+
+        // Keep this relay under the custom retry scheduler. Setting
+        // nodeRefresh here would let vanilla clear a freshly rebuilt link on
+        // its next update before this recovery pass can stabilize it.
+    }
+
+    private static boolean linkRecoveredParent(
+            Object world,
+            Object node,
+            WeakReference<Object> oldParent,
+            WeakReference<Object> recovered
+    ) {
+        if (!isConnectedReference(recovered) || !setParent(node, recovered)) {
+            return false;
+        }
+
+        removeChildReference(oldParent, node);
+        rememberParent(world, node, recovered);
+        notifyRelayLinkChanged(world, node, oldParent, recovered);
+        recordRebuiltLink(world);
+        logFixedIfPreviouslyBroken(world, node, recovered);
+        return true;
+    }
+
+    /**
+     * Start a newly loaded relay from a known broken state instead of trusting
+     * a partial parent/child graph restored by the chunk.
+     */
+    private static void clearRelayConnectionsForReload(Object world, Object node) {
+        WeakReference<Object> oldParent = getReference(node, "getParent()");
+        recordQueuedRelay(world);
+
+        removeChildReference(oldParent, node);
+        setParent(node, null);
+        markReferencedParentForUpdate(world, oldParent);
+
+        Object children = invokeNoArgs(node, "getChildren()");
+        if (children instanceof List) {
+            for (Object childReference : (List<?>) children) {
+                if (!(childReference instanceof WeakReference)) {
+                    continue;
+                }
+                Object child = ((WeakReference<?>) childReference).get();
+                if (child == null) {
+                    continue;
+                }
+                WeakReference<Object> childParent = getReference(child, "getParent()");
+                if (childParent != null && childParent.get() == node) {
+                    setParent(child, null);
+                    notifyRelayLinkChanged(world, child, childParent, null);
+                }
+            }
+            ((List<?>) children).clear();
+            clearNearbyNodeCache();
+        }
+
+        notifyParentChanged(world, node);
     }
 
     public static WeakReference<Object> recoverIfDisconnected(WeakReference<Object> originalParent, Object node) {
@@ -205,6 +252,7 @@ public final class VisRelayChunkLoader {
             removeChildReference(originalParent, node);
             linkChild(rememberedParent.get(), node);
             rememberParent(world, node, rememberedParent);
+            notifyRelayLinkChanged(world, node, originalParent, rememberedParent);
             logFixedIfPreviouslyBroken(world, node, rememberedParent);
             return rememberedParent;
         }
@@ -226,10 +274,6 @@ public final class VisRelayChunkLoader {
             }
         }
 
-        if (markBrokenIfNeeded(node)) {
-            logBroken(world, node);
-        }
-
         WeakReference<Object> recovered = findAndLinkNearbyNode(world, node, originalParent);
         if (!isConnectedReference(recovered) && bootstrapRelayFromSource(world)) {
             if (isConnected(node)) {
@@ -240,6 +284,8 @@ public final class VisRelayChunkLoader {
         if (isConnectedReference(recovered)) {
             removeChildReference(originalParent, node);
             rememberParent(world, node, recovered);
+            notifyRelayLinkChanged(world, node, originalParent, recovered);
+            recordRebuiltLink(world);
             logFixedIfPreviouslyBroken(world, node, recovered);
         }
         return recovered;
@@ -275,9 +321,26 @@ public final class VisRelayChunkLoader {
 
         for (Object tileEntity : ((Map<?, ?>) tileEntities).values()) {
             if (isVisNode(tileEntity)) {
-                register(world, tileEntity);
-                rememberCurrentParent(world, tileEntity);
+                prepareNodeForReload(world, tileEntity);
             }
+        }
+    }
+
+    /**
+     * A chunk scan can discover relay TileEntities before their first tick.
+     * Prepare those relays immediately so the recovery pass never grows from
+     * a partially restored Thaumcraft graph in a neighbouring chunk.
+     */
+    private static void prepareNodeForReload(Object world, Object node) {
+        register(world, node);
+        if (!markNodeObserved(node)) {
+            return;
+        }
+
+        rememberCurrentParent(world, node);
+        if (!isSource(node)) {
+            clearRelayConnectionsForReload(world, node);
+            scheduleValidationRetry(node, world);
         }
     }
 
@@ -420,15 +483,60 @@ public final class VisRelayChunkLoader {
             return false;
         }
 
-        if (markBrokenIfNeeded(closestRelay)) {
-            logBroken(world, closestRelay);
-        }
         removeChildReference(oldParent, closestRelay);
         linkChild(closestSource, closestRelay);
         rememberParent(world, closestRelay, sourceReference);
-        notifyParentChanged(world, closestRelay);
+        notifyRelayLinkChanged(world, closestRelay, oldParent, sourceReference);
+        recordRebuiltLink(world);
         logFixedIfPreviouslyBroken(world, closestRelay, sourceReference);
         return true;
+    }
+
+    /**
+     * Connect every relay that can currently see an energized parent. Each
+     * successful link can unlock the next relay in a vertical or horizontal
+     * run, so repeat until this loaded graph cannot grow any farther.
+     */
+    private static boolean rebuildEnergizedRelayGrid(Object world) {
+        boolean changed = bootstrapRelayFromSource(world);
+        boolean expanded;
+        do {
+            expanded = false;
+            for (Object relay : getRegisteredNodes(world)) {
+                if (isSource(relay) || isConnected(relay)) {
+                    continue;
+                }
+
+                ensureNearbyChunksLoaded(relay);
+                WeakReference<Object> oldParent = getReference(relay, "getParent()");
+                WeakReference<Object> recovered = findAndLinkNearbyNode(world, relay, oldParent);
+                if (linkRecoveredParent(world, relay, oldParent, recovered)) {
+                    expanded = true;
+                    changed = true;
+                }
+            }
+        } while (expanded);
+        return changed;
+    }
+
+    private static List<Object> getRegisteredNodes(Object world) {
+        List<Object> nodes = new java.util.ArrayList<Object>();
+        synchronized (NODES) {
+            Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(world);
+            if (worldNodes == null) {
+                return nodes;
+            }
+
+            for (java.util.Iterator<Map.Entry<NodeKey, WeakReference<Object>>> iterator = worldNodes.entrySet().iterator(); iterator.hasNext();) {
+                Object candidate = iterator.next().getValue().get();
+                if (candidate == null || !isLiveNode(candidate)) {
+                    iterator.remove();
+                    continue;
+                }
+                nodes.add(candidate);
+            }
+        }
+        return nodes;
     }
 
     private static long squaredDistance(NodeKey first, NodeKey second) {
@@ -581,47 +689,6 @@ public final class VisRelayChunkLoader {
                 }
             }
         }
-    }
-
-    /**
-     * Rebuilds a remembered relay branch from its rooted parent outward. This
-     * lets a whole loaded branch recover in one validation pass instead of
-     * relying on the order in which TileEntities happen to tick after reload.
-     */
-    private static boolean restoreRememberedParentChain(Object world, Object node) {
-        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
-        return restoreRememberedParentChain(world, node, visited);
-    }
-
-    private static boolean restoreRememberedParentChain(Object world, Object node, Set<Object> visited) {
-        if (isConnected(node)) {
-            return true;
-        }
-        if (!visited.add(node)) {
-            return false;
-        }
-
-        WeakReference<Object> parentReference = findRememberedParent(world, node);
-        if (parentReference == null) {
-            return false;
-        }
-
-        Object parent = parentReference.get();
-        if (!restoreRememberedParentChain(world, parent, visited)
-                || !canUseAsParent(node, parentReference)) {
-            return false;
-        }
-
-        WeakReference<Object> oldParent = getReference(node, "getParent()");
-        if (!setParent(node, parentReference)) {
-            return false;
-        }
-        removeChildReference(oldParent, node);
-        linkChild(parent, node);
-        rememberParent(world, node, parentReference);
-        notifyParentChanged(world, node);
-        logFixedIfPreviouslyBroken(world, node, parentReference);
-        return true;
     }
 
     private static boolean canUseAsParent(Object node, WeakReference<Object> parentReference) {
@@ -855,11 +922,16 @@ public final class VisRelayChunkLoader {
     }
 
     private static void removeChildReference(WeakReference<Object> parentReference, Object node) {
-        if (!isValidReference(parentReference)) {
+        if (parentReference == null) {
             return;
         }
 
-        Object children = invokeNoArgs(parentReference.get(), "getChildren()");
+        Object parent = parentReference.get();
+        if (parent == null) {
+            return;
+        }
+
+        Object children = invokeNoArgs(parent, "getChildren()");
         if (!(children instanceof List)) {
             return;
         }
@@ -892,20 +964,32 @@ public final class VisRelayChunkLoader {
         clearNearbyNodeCache();
     }
 
-    private static void setNodeRefresh(Object node) {
-        try {
-            Field field = findField(node.getClass(), "nodeRefresh");
-            if (field != null) {
-                field.setAccessible(true);
-                field.setBoolean(node, true);
-            }
-        } catch (IllegalAccessException ignored) {
-            // Falling back to Thaumcraft's next normal connection attempt is safe.
+    private static void notifyParentChanged(Object world, Object node) {
+        invokeNoArgs(node, "parentChanged()");
+        markNodeForUpdate(world, node);
+    }
+
+    private static void notifyRelayLinkChanged(
+            Object world,
+            Object node,
+            WeakReference<Object> oldParent,
+            WeakReference<Object> newParent
+    ) {
+        notifyParentChanged(world, node);
+        markReferencedParentForUpdate(world, oldParent);
+        markReferencedParentForUpdate(world, newParent);
+    }
+
+    private static void markReferencedParentForUpdate(Object world, WeakReference<Object> parentReference) {
+        if (parentReference != null) {
+            markNodeForUpdate(world, parentReference.get());
         }
     }
 
-    private static void notifyParentChanged(Object world, Object node) {
-        invokeNoArgs(node, "parentChanged()");
+    private static void markNodeForUpdate(Object world, Object node) {
+        if (world == null || node == null) {
+            return;
+        }
 
         Object x = readValue(node, "xCoord", "field_145851_c");
         Object y = readValue(node, "yCoord", "field_145848_d");
@@ -957,9 +1041,15 @@ public final class VisRelayChunkLoader {
         return value instanceof Number ? ((Number) value).longValue() : -1L;
     }
 
-    private static boolean markBrokenIfNeeded(Object node) {
+    private static void recordQueuedRelay(Object world) {
         synchronized (NODES) {
-            return BROKEN_LOGGED.put(node, Boolean.TRUE) == null;
+            getRebuildLogState(world).queuedRelays++;
+        }
+    }
+
+    private static void recordRebuiltLink(Object world) {
+        synchronized (NODES) {
+            getRebuildLogState(world).rebuiltLinks++;
         }
     }
 
@@ -970,24 +1060,58 @@ public final class VisRelayChunkLoader {
         }
 
         synchronized (NODES) {
-            if (BROKEN_LOGGED.remove(node) == null) {
-                return;
-            }
             NEXT_RECOVERY.remove(node);
         }
-        logFixed(world, node, parent);
     }
 
-    private static void logBroken(Object world, Object node) {
-        logInfo(String.format(
-                "[VisRelayFix] Broken parent chain for %s at %s; attempting repair.",
-                nodeLabel(node), describeLocation(world, node)));
+    private static void logRebuildResult(Object world, Object node, boolean completed) {
+        int queuedRelays;
+        int rebuiltLinks;
+        synchronized (NODES) {
+            RebuildLogState state = REBUILD_LOGS.get(world);
+            if (state == null) {
+                return;
+            }
+
+            long worldTime = readWorldTime(world);
+            if (!completed) {
+                if (worldTime >= 0L && state.lastWaitingLogAt >= 0L
+                        && worldTime - state.lastWaitingLogAt < REBUILD_WAIT_LOG_INTERVAL_TICKS) {
+                    return;
+                }
+                state.lastWaitingLogAt = worldTime;
+                queuedRelays = state.queuedRelays;
+                rebuiltLinks = state.rebuiltLinks;
+            } else {
+                if (state.queuedRelays == 0 && state.rebuiltLinks == 0) {
+                    return;
+                }
+                queuedRelays = state.queuedRelays;
+                rebuiltLinks = state.rebuiltLinks;
+                state.queuedRelays = 0;
+                state.rebuiltLinks = 0;
+                state.lastWaitingLogAt = -1L;
+            }
+        }
+
+        if (completed) {
+            logInfo(String.format(
+                    "[VisRelayFix] Relay rebuild completed near %s: %d relay(s) reset, %d energized link(s) rebuilt.",
+                    describeLocation(world, node), queuedRelays, rebuiltLinks));
+        } else {
+            logInfo(String.format(
+                    "[VisRelayFix] Relay rebuild waiting near %s: %d relay(s) reset, %d link(s) rebuilt; no energized route is loaded yet.",
+                    describeLocation(world, node), queuedRelays, rebuiltLinks));
+        }
     }
 
-    private static void logFixed(Object world, Object node, Object parent) {
-        logInfo(String.format(
-                "[VisRelayFix] Fixed %s at %s by linking to %s at %s.",
-                nodeLabel(node), describeLocation(world, node), nodeLabel(parent), describeLocation(world, parent)));
+    private static RebuildLogState getRebuildLogState(Object world) {
+        RebuildLogState state = REBUILD_LOGS.get(world);
+        if (state == null) {
+            state = new RebuildLogState();
+            REBUILD_LOGS.put(world, state);
+        }
+        return state;
     }
 
     private static void logInfo(String message) {
@@ -1177,5 +1301,11 @@ public final class VisRelayChunkLoader {
             this.parentKey = parentKey;
             this.lastUsedAt = lastUsedAt;
         }
+    }
+
+    private static final class RebuildLogState {
+        private int queuedRelays;
+        private int rebuiltLinks;
+        private long lastWaitingLogAt = -1L;
     }
 }

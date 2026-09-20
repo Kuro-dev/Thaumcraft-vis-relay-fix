@@ -23,7 +23,7 @@ final class VisRelayFixConfig {
                     "enableLogging",
                     Configuration.CATEGORY_GENERAL,
                     true,
-                    "Write relay break and repair messages to the server log."
+                    "Write compact relay rebuild summaries to the server log."
             );
             if (config.hasChanged()) {
                 config.save();

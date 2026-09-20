@@ -4,6 +4,7 @@ import org.junit.Test;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
@@ -57,7 +58,16 @@ public class VisRelayFixTest {
         );
 
         List<String> hooks = new ArrayList<>();
+        final boolean[] hasValidationField = new boolean[1];
         new ClassReader(transformed).accept(new ClassVisitor(Opcodes.ASM4) {
+            @Override
+            public FieldVisitor visitField(int access, String name, String descriptor, String signature, Object value) {
+                if ("visRelayFixValidated".equals(name) && "Z".equals(descriptor)) {
+                    hasValidationField[0] = true;
+                }
+                return super.visitField(access, name, descriptor, signature, value);
+            }
+
             @Override
             public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
                 return new MethodVisitor(Opcodes.ASM4, super.visitMethod(access, name, descriptor, signature, exceptions)) {
@@ -76,6 +86,7 @@ public class VisRelayFixTest {
         assertEquals("registerNode", hooks.get(1));
         assertEquals("ensureNearbyChunksLoaded", hooks.get(2));
         assertEquals("recoverIfDisconnected", hooks.get(3));
+        assertTrue(hasValidationField[0]);
     }
 
     @Test
@@ -94,7 +105,7 @@ public class VisRelayFixTest {
     }
 
     @Test
-    public void relayWithLiveButDisconnectedParentRepairsBrokenAncestor() {
+    public void relayWithLiveButDisconnectedParentRejoinsTheEnergizedGrid() {
         FakeWorld world = new FakeWorld();
         FakeNode source = new FakeNode(world, 0, 64, 0, true);
         FakeNode disconnectedRelay = new FakeNode(world, 3, 64, 0, false);
@@ -105,19 +116,65 @@ public class VisRelayFixTest {
         VisRelayChunkLoader.registerNode(source);
         VisRelayChunkLoader.registerNode(disconnectedRelay);
         VisRelayChunkLoader.registerNode(target);
-        VisRelayChunkLoader.validateExistingConnection(target);
+        assertTrue(VisRelayChunkLoader.validateExistingConnection(target));
+        assertTrue(VisRelayChunkLoader.validateExistingConnection(disconnectedRelay));
 
-        assertSame(disconnectedRelay, target.getParent().get());
-        assertEquals(1, source.children.size());
-        assertSame(disconnectedRelay, source.children.get(0).get());
-        assertEquals(1, disconnectedRelay.children.size());
-        assertSame(target, disconnectedRelay.children.get(0).get());
-        assertSame(source, disconnectedRelay.getParent().get());
+        assertTrue(reachesSource(source, target));
+        assertTrue(reachesSource(source, disconnectedRelay));
         assertFalse(target.nodeRefresh);
     }
 
     @Test
-    public void downstreamRelayDoesNotJumpToNearbySiblingDuringAncestorRepair() {
+    public void recoveredLinksRefreshBothVisualEndpoints() {
+        FakeWorld world = new FakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode oldParent = new FakeNode(world, 12, 64, 0, false);
+        FakeNode target = new FakeNode(world, 5, 64, 0, false);
+        target.setParent(new WeakReference<>(oldParent));
+        oldParent.children.add(new WeakReference<>(target));
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(oldParent);
+        VisRelayChunkLoader.registerNode(target);
+        VisRelayChunkLoader.validateExistingConnection(target);
+
+        assertTrue(world.updatedBlocks.contains("5:64:0"));
+        assertTrue(world.updatedBlocks.contains("12:64:0"));
+        assertTrue(world.updatedBlocks.contains("0:64:0"));
+    }
+
+    @Test
+    public void chunkReloadClearsRelayLinksBeforeRebuildingFromTheSource() {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode firstRelay = new FakeNode(world, 0, 70, 0, false);
+        FakeNode downstreamRelay = new FakeNode(world, 0, 76, 0, false);
+        connect(source, firstRelay);
+        connect(firstRelay, downstreamRelay);
+
+        VisRelayChunkLoader.registerNode(source);
+        VisRelayChunkLoader.registerNode(firstRelay);
+        VisRelayChunkLoader.registerNode(downstreamRelay);
+        VisRelayChunkLoader.validateExistingConnection(source);
+        assertFalse(VisRelayChunkLoader.validateExistingConnection(firstRelay));
+        assertFalse(VisRelayChunkLoader.validateExistingConnection(downstreamRelay));
+
+        assertNull(firstRelay.getParent());
+        assertNull(downstreamRelay.getParent());
+        assertTrue(source.children.isEmpty());
+        assertTrue(firstRelay.children.isEmpty());
+
+        world.totalWorldTime = 40L;
+        assertTrue(VisRelayChunkLoader.validateExistingConnection(downstreamRelay));
+
+        assertTrue(reachesSource(source, firstRelay));
+        assertTrue(reachesSource(source, downstreamRelay));
+        assertFalse(firstRelay.nodeRefresh);
+        assertFalse(downstreamRelay.nodeRefresh);
+    }
+
+    @Test
+    public void disconnectedRelaysRejoinTheEnergizedGridThroughAnyValidRoute() {
         FakeWorld world = new FakeWorld();
         FakeNode source = new FakeNode(world, 0, 64, 0, true);
         FakeNode healthySibling = new FakeNode(world, 3, 64, 0, false);
@@ -132,12 +189,11 @@ public class VisRelayFixTest {
         VisRelayChunkLoader.registerNode(healthySibling);
         VisRelayChunkLoader.registerNode(brokenAncestor);
         VisRelayChunkLoader.registerNode(downstream);
-        VisRelayChunkLoader.validateExistingConnection(downstream);
+        assertTrue(VisRelayChunkLoader.validateExistingConnection(downstream));
+        assertTrue(VisRelayChunkLoader.validateExistingConnection(brokenAncestor));
 
-        assertSame(brokenAncestor, downstream.getParent().get());
-        assertSame(healthySibling, brokenAncestor.getParent().get());
-        assertEquals(1, brokenAncestor.children.size());
-        assertSame(downstream, brokenAncestor.children.get(0).get());
+        assertTrue(reachesSource(source, downstream));
+        assertTrue(reachesSource(source, brokenAncestor));
     }
 
     @Test
@@ -177,7 +233,7 @@ public class VisRelayFixTest {
         VisRelayChunkLoader.registerNode(source);
         VisRelayChunkLoader.registerNode(rememberedParent);
         VisRelayChunkLoader.registerNode(nearbySibling);
-        VisRelayChunkLoader.validateExistingConnection(target);
+        VisRelayChunkLoader.registerNode(target);
 
         target.setParent(null);
         nearbySibling.children.add(new WeakReference<>(target));
@@ -193,13 +249,13 @@ public class VisRelayFixTest {
     }
 
     @Test
-    public void relayWithoutAnyParentRequestsThaumcraftConnectionRetry() {
+    public void relayWithoutAnyParentStaysUnderTheCustomRetryScheduler() {
         FakeWorld world = new FakeWorld();
         FakeNode target = new FakeNode(world, 5, 64, 0, false);
 
         VisRelayChunkLoader.validateExistingConnection(target);
 
-        assertTrue(target.nodeRefresh);
+        assertFalse(target.nodeRefresh);
     }
 
     @Test
@@ -234,7 +290,7 @@ public class VisRelayFixTest {
 
         world.totalWorldTime = 40L;
         VisRelayChunkLoader.validateExistingConnection(target);
-        assertTrue(target.nodeRefresh);
+        assertFalse(target.nodeRefresh);
     }
 
     @Test
@@ -244,9 +300,10 @@ public class VisRelayFixTest {
         FakeNode relay = new FakeNode(world, 5, 64, 0, false);
         connect(source, relay);
 
-        VisRelayChunkLoader.validateExistingConnection(relay);
+        VisRelayChunkLoader.registerNode(source);
+        assertFalse(VisRelayChunkLoader.validateExistingConnection(relay));
         world.totalWorldTime = 40L;
-        VisRelayChunkLoader.validateExistingConnection(relay);
+        assertTrue(VisRelayChunkLoader.validateExistingConnection(relay));
         relay.resetParentAccesses();
 
         for (int tick = 0; tick < 100; tick++) {
@@ -269,11 +326,11 @@ public class VisRelayFixTest {
         VisRelayChunkLoader.registerNode(target);
         VisRelayChunkLoader.validateExistingConnection(target);
 
-        assertTrue(target.nodeRefresh);
+        assertFalse(target.nodeRefresh);
     }
 
     @Test
-    public void reloadRestoresEntireRememberedRelayBranch() {
+    public void reloadRebuildsEntireRelayBranchFromSource() {
         FakeWorld world = new FakeWorld();
         FakeNode oldSource = new FakeNode(world, 0, 64, 0, true);
         FakeNode oldFirst = new FakeNode(world, 4, 64, 0, false);
@@ -309,7 +366,7 @@ public class VisRelayFixTest {
     }
 
     @Test
-    public void verticalReloadWaitsForCurrentRelayInstancesBeforeRestoring() {
+    public void verticalReloadWaitsForCurrentRelayInstancesBeforeRebuilding() {
         FakeWorld world = new FakeWorld();
         FakeNode oldSource = new FakeNode(world, 0, 64, 0, true);
         FakeNode oldFirst = new FakeNode(world, 0, 70, 0, false);
@@ -333,7 +390,7 @@ public class VisRelayFixTest {
 
         VisRelayChunkLoader.validateExistingConnection(third);
         assertNull(third.getParent());
-        assertTrue(third.nodeRefresh);
+        assertFalse(third.nodeRefresh);
 
         VisRelayChunkLoader.registerNode(first);
         VisRelayChunkLoader.registerNode(second);
@@ -461,9 +518,23 @@ public class VisRelayFixTest {
         parent.children.add(new WeakReference<>(child));
     }
 
+    private static boolean reachesSource(FakeNode source, FakeNode node) {
+        Set<FakeNode> visited = new HashSet<>();
+        FakeNode current = node;
+        for (int depth = 0; depth < 512 && current != null && visited.add(current); depth++) {
+            if (current == source) {
+                return true;
+            }
+            WeakReference<FakeNode> parent = current.getParent();
+            current = parent == null ? null : parent.get();
+        }
+        return false;
+    }
+
     public static class FakeWorld {
         public boolean isRemote;
         public final FakeChunkProvider chunkProvider = new FakeChunkProvider();
+        public final Set<String> updatedBlocks = new HashSet<>();
         private final java.util.Map<String, FakeNode> tileEntities = new java.util.HashMap<>();
 
         public FakeChunkProvider getChunkProvider() {
@@ -480,6 +551,10 @@ public class VisRelayFixTest {
 
         void removeTileEntity(int x, int y, int z) {
             tileEntities.remove(x + ":" + y + ":" + z);
+        }
+
+        public void markBlockForUpdate(int x, int y, int z) {
+            updatedBlocks.add(x + ":" + y + ":" + z);
         }
     }
 

@@ -30,7 +30,7 @@ public final class VisRelayFixCorePlugin implements IFMLLoadingPlugin {
         if (mcLocation instanceof File) {
             VisRelayFixConfig.initialize((File) mcLocation);
         }
-        FMLLog.info("[VisRelayFix] Thaumcraft Vis Relay Fix 1.1.9 loaded.");
+        FMLLog.info("[VisRelayFix] Thaumcraft Vis Relay Fix 1.1.18 loaded.");
     }
 
     @Override
