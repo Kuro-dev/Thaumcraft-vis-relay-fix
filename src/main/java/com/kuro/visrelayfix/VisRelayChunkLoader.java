@@ -32,6 +32,76 @@ public final class VisRelayChunkLoader {
     private VisRelayChunkLoader() {
     }
 
+    public static void registerNodesInLoadedChunk(Object world, int chunkX, int chunkZ) {
+        if (world == null || readBoolean(world, "isRemote", "field_72995_K")) {
+            return;
+        }
+
+        Object provider = invokeNoArgs(world, "getChunkProvider", "func_72863_F");
+        if (provider == null || !invokeBoolean(provider, new String[]{"chunkExists", "func_73149_a"}, chunkX, chunkZ)) {
+            return;
+        }
+
+        Object chunk = invoke(provider, new String[]{"provideChunk", "func_73154_d"}, chunkX, chunkZ);
+        if (chunk != null) {
+            registerNodesInChunk(world, chunk);
+        }
+    }
+
+    public static ManualRebuildStats countRegisteredNodes(Map<Object, List<VisRelayManualCommand.ChunkTarget>> chunksByWorld) {
+        ManualRebuildStats stats = new ManualRebuildStats();
+        synchronized (NODES) {
+            for (Map.Entry<Object, List<VisRelayManualCommand.ChunkTarget>> entry : chunksByWorld.entrySet()) {
+                Map<NodeKey, WeakReference<Object>> worldNodes = NODES.get(entry.getKey());
+                if (worldNodes == null) {
+                    continue;
+                }
+
+                for (Map.Entry<NodeKey, WeakReference<Object>> nodeEntry : worldNodes.entrySet()) {
+                    Object node = nodeEntry.getValue().get();
+                    if (node == null || !isLiveNode(node) || !containsChunk(entry.getValue(), nodeEntry.getKey())) {
+                        continue;
+                    }
+                    if (isSource(node)) {
+                        stats.sources++;
+                    } else {
+                        stats.relays++;
+                    }
+                }
+            }
+        }
+        return stats;
+    }
+
+    public static ManualRebuildStats revalidateRegisteredRelays(Map<Object, List<VisRelayManualCommand.ChunkTarget>> chunksByWorld) {
+        ManualRebuildStats stats = new ManualRebuildStats();
+        for (Map.Entry<Object, List<VisRelayManualCommand.ChunkTarget>> entry : chunksByWorld.entrySet()) {
+            Object world = entry.getKey();
+            List<Object> nodes = getRegisteredNodes(world);
+            for (Object node : nodes) {
+                NodeKey key = getNodeKey(node);
+                if (key == null || !containsChunk(entry.getValue(), key) || isSource(node)) {
+                    continue;
+                }
+
+                boolean wasConnected = isConnected(node);
+                clearRelayConnectionsForReload(world, node);
+                stats.resetRelays++;
+                repairDisconnectedNode(world, node);
+                if (!wasConnected && isConnected(node)) {
+                    stats.fixedBrokenRelays++;
+                }
+            }
+
+            int rebuiltBefore = readAndResetRebuiltLinks(world);
+            if (rebuildEnergizedRelayGrid(world)) {
+                stats.rebuiltLinks += readAndResetRebuiltLinks(world);
+            }
+            stats.rebuiltLinks += rebuiltBefore;
+        }
+        return stats;
+    }
+
     public static void ensureNearbyChunksLoaded(Object node) {
         if (node == null) {
             return;
@@ -556,6 +626,17 @@ public final class VisRelayChunkLoader {
         return relayComparison < 0 || relayComparison == 0 && compareNodeKeys(source, currentSource) < 0;
     }
 
+    private static boolean containsChunk(List<VisRelayManualCommand.ChunkTarget> chunks, NodeKey key) {
+        int chunkX = key.x >> 4;
+        int chunkZ = key.z >> 4;
+        for (VisRelayManualCommand.ChunkTarget chunk : chunks) {
+            if (chunk.x == chunkX && chunk.z == chunkZ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static int compareNodeKeys(NodeKey first, NodeKey second) {
         if (first.x != second.x) {
             return first.x < second.x ? -1 : 1;
@@ -1057,6 +1138,20 @@ public final class VisRelayChunkLoader {
         }
     }
 
+    private static int readAndResetRebuiltLinks(Object world) {
+        synchronized (NODES) {
+            RebuildLogState state = REBUILD_LOGS.get(world);
+            if (state == null) {
+                return 0;
+            }
+            int rebuiltLinks = state.rebuiltLinks;
+            state.queuedRelays = 0;
+            state.rebuiltLinks = 0;
+            state.lastWaitingLogAt = -1L;
+            return rebuiltLinks;
+        }
+    }
+
     private static void logFixedIfPreviouslyBroken(Object world, Object node, WeakReference<Object> parentReference) {
         Object parent = isValidReference(parentReference) ? parentReference.get() : null;
         if (parent == null) {
@@ -1295,6 +1390,14 @@ public final class VisRelayChunkLoader {
             result = 31 * result + y;
             return 31 * result + z;
         }
+    }
+
+    public static final class ManualRebuildStats {
+        public int sources;
+        public int relays;
+        public int resetRelays;
+        public int rebuiltLinks;
+        public int fixedBrokenRelays;
     }
 
     private static final class RememberedParent {

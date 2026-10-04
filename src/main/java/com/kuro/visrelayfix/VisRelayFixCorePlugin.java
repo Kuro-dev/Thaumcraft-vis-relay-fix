@@ -16,7 +16,7 @@ public final class VisRelayFixCorePlugin implements IFMLLoadingPlugin {
 
     @Override
     public String getModContainerClass() {
-        return null;
+        return VisRelayFixModContainer.class.getName();
     }
 
     @Override

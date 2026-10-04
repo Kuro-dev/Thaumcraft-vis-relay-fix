@@ -12,6 +12,18 @@ The server log reports one compact summary for a rebuild: the number of relays r
 
 Logging is enabled by default. After the game or server starts once, set `B:enableLogging=false` in `config/ThaumcraftVisRelayFix.cfg` to silence these messages.
 
+## Command
+
+Server operators can manually rebuild loaded vis relay graphs with:
+
+```text
+/visrelayfix
+```
+
+The command scans the currently loaded chunks around all online players, registers any Thaumcraft vis nodes it finds, clears relay links in that loaded area, and rebuilds the energized graph from live source nodes. It sends private chat feedback to the command sender while it works, including source-location/build phases, periodic percentage updates, and a final count of potentially broken relays fixed.
+
+The command implementation uses reflection on the Minecraft command and chat classes on purpose. This project is built as a compact Forge coremod against the 1.7.10 Forge universal jar, where Forge lifecycle classes are available to javac but many Minecraft command/chat types are obfuscated or missing from the compile class path. Reflection keeps the jar server-side and avoids requiring a ForgeGradle deobfuscated development setup just to expose one administrative command.
+
 ## Build
 
 ```text
