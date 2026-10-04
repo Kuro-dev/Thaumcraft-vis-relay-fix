@@ -61,22 +61,14 @@ public final class VisRelayFixTransformer implements IClassTransformer {
                     if (isNodeUpdate) {
                         Label continueUpdate = new Label();
                         visitVarInsn(Opcodes.ALOAD, 0);
-                        visitFieldInsn(Opcodes.GETFIELD, TARGET_CLASS.replace('.', '/'), VALIDATED_FIELD, "Z");
-                        visitJumpInsn(Opcodes.IFNE, continueUpdate);
-                        visitVarInsn(Opcodes.ALOAD, 0);
                         visitMethodInsn(
                                 Opcodes.INVOKESTATIC,
                                 HELPER_OWNER,
                                 "validateExistingConnection",
                                 "(Ljava/lang/Object;)Z"
                         );
-                        Label markValidated = new Label();
-                        visitJumpInsn(Opcodes.IFNE, markValidated);
+                        visitJumpInsn(Opcodes.IFNE, continueUpdate);
                         visitInsn(Opcodes.RETURN);
-                        visitLabel(markValidated);
-                        visitVarInsn(Opcodes.ALOAD, 0);
-                        visitInsn(Opcodes.ICONST_1);
-                        visitFieldInsn(Opcodes.PUTFIELD, TARGET_CLASS.replace('.', '/'), VALIDATED_FIELD, "Z");
                         visitLabel(continueUpdate);
                         patched = true;
                     }

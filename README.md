@@ -21,7 +21,7 @@ mvn clean package
 The server-ready jar is created at:
 
 ```text
-target/ThaumcraftVisRelayFix-1.1.18.jar
+target/ThaumcraftVisRelayFix-1.1.21.jar
 ```
 
 Place that jar in the server's `mods` directory alongside Thaumcraft 4.2.3.5. For singleplayer, place it in the client `mods` directory instead.

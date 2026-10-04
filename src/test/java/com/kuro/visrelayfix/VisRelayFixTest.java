@@ -125,7 +125,7 @@ public class VisRelayFixTest {
     }
 
     @Test
-    public void recoveredLinksRefreshBothVisualEndpoints() {
+    public void validationRebuildRefreshesBothVisualEndpointsAfterParentIsSet() {
         FakeWorld world = new FakeWorld();
         FakeNode source = new FakeNode(world, 0, 64, 0, true);
         FakeNode oldParent = new FakeNode(world, 12, 64, 0, false);
@@ -311,6 +311,37 @@ public class VisRelayFixTest {
         }
 
         assertEquals(0, relay.parentAccesses);
+    }
+
+    @Test
+    public void longLivedLoadedRelayIsRecheckedByTickingAndRepaired() {
+        TimedFakeWorld world = new TimedFakeWorld();
+        FakeNode source = new FakeNode(world, 0, 64, 0, true);
+        FakeNode relay = new FakeNode(world, 5, 64, 0, false);
+        connect(source, relay);
+
+        VisRelayChunkLoader.registerNode(source);
+        for (int tick = 0; tick < 40; tick++) {
+            assertFalse(tickRelay(world, relay));
+        }
+        assertTrue(tickRelay(world, relay));
+
+        relay.setParent(null);
+        source.children.clear();
+        relay.resetParentAccesses();
+
+        for (int tick = 0; tick < 1_200; tick++) {
+            assertTrue(tickRelay(world, relay));
+            assertNull(relay.getParent());
+        }
+        assertEquals(1_241L, world.totalWorldTime);
+        assertEquals(1_200, relay.parentAccesses);
+
+        assertTrue(tickRelay(world, relay));
+
+        assertSame(source, relay.getParent().get());
+        assertEquals(1, source.children.size());
+        assertSame(relay, source.children.get(0).get());
     }
 
     @Test
@@ -529,6 +560,12 @@ public class VisRelayFixTest {
             current = parent == null ? null : parent.get();
         }
         return false;
+    }
+
+    private static boolean tickRelay(TimedFakeWorld world, FakeNode relay) {
+        boolean canUpdate = VisRelayChunkLoader.validateExistingConnection(relay);
+        world.totalWorldTime++;
+        return canUpdate;
     }
 
     public static class FakeWorld {

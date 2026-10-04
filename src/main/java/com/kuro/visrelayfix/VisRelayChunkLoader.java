@@ -15,6 +15,7 @@ import java.util.WeakHashMap;
 
 public final class VisRelayChunkLoader {
     private static final long LOAD_SETTLE_TICKS = 40L;
+    private static final long HEALTH_CHECK_INTERVAL_TICKS = 1_200L;
     private static final long RECOVERY_INTERVAL_TICKS = 200L;
     private static final long REBUILD_WAIT_LOG_INTERVAL_TICKS = 200L;
     private static final long STATE_CLEANUP_INTERVAL_TICKS = 1_200L;
@@ -93,11 +94,11 @@ public final class VisRelayChunkLoader {
      * every relay in its parent chain must eventually reach a source node.
      */
     /**
-     * @return true once this TileVisNode can skip all further validation until
-     *         its chunk creates a fresh TileEntity instance on the next load.
+     * @return true when Thaumcraft can run this tick. Returns false only while
+     *         the relay is settling or waiting for a usable energized route.
      */
     public static boolean validateExistingConnection(Object node) {
-        if (node == null || isValidationComplete(node)) {
+        if (node == null) {
             return true;
         }
         if (isInvalid(node)) {
@@ -115,8 +116,8 @@ public final class VisRelayChunkLoader {
             markValidationComplete(node);
             return true;
         }
-        if (!shouldValidateOnLoad(node, world)) {
-            return false;
+        if (!shouldRunValidation(node, world)) {
+            return isValidationMarkedComplete(node);
         }
 
         rememberCurrentParent(world, node);
@@ -124,6 +125,7 @@ public final class VisRelayChunkLoader {
         if (isConnected(node)) {
             logFixedIfPreviouslyBroken(world, node, getReference(node, "getParent()"));
             logRebuildResult(world, node, true);
+            markValidationComplete(node);
             return true;
         }
 
@@ -141,6 +143,7 @@ public final class VisRelayChunkLoader {
             return false;
         }
         logRebuildResult(world, node, true);
+        markValidationComplete(node);
         return true;
     }
 
@@ -252,7 +255,6 @@ public final class VisRelayChunkLoader {
             removeChildReference(originalParent, node);
             linkChild(rememberedParent.get(), node);
             rememberParent(world, node, rememberedParent);
-            notifyRelayLinkChanged(world, node, originalParent, rememberedParent);
             logFixedIfPreviouslyBroken(world, node, rememberedParent);
             return rememberedParent;
         }
@@ -284,7 +286,6 @@ public final class VisRelayChunkLoader {
         if (isConnectedReference(recovered)) {
             removeChildReference(originalParent, node);
             rememberParent(world, node, recovered);
-            notifyRelayLinkChanged(world, node, originalParent, recovered);
             recordRebuiltLink(world);
             logFixedIfPreviouslyBroken(world, node, recovered);
         }
@@ -847,10 +848,11 @@ public final class VisRelayChunkLoader {
                 && findMethod(tileEntity.getClass(), "getChildren", 0) != null;
     }
 
-    private static boolean shouldValidateOnLoad(Object node, Object world) {
+    private static boolean shouldRunValidation(Object node, Object world) {
         long worldTime = readWorldTime(world);
         synchronized (NODES) {
-            if (VALIDATED_ON_LOAD.containsKey(node)) {
+            boolean validated = VALIDATED_ON_LOAD.containsKey(node);
+            if (worldTime < 0L && validated) {
                 return false;
             }
             if (worldTime < 0L) {
@@ -860,7 +862,7 @@ public final class VisRelayChunkLoader {
 
             Long due = VALIDATION_DUE.get(node);
             if (due == null) {
-                VALIDATION_DUE.put(node, worldTime + LOAD_SETTLE_TICKS);
+                VALIDATION_DUE.put(node, worldTime + (validated ? HEALTH_CHECK_INTERVAL_TICKS : LOAD_SETTLE_TICKS));
                 return false;
             }
             if (worldTime < due) {
@@ -868,20 +870,22 @@ public final class VisRelayChunkLoader {
             }
 
             VALIDATION_DUE.remove(node);
-            VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
+            if (!validated) {
+                VALIDATED_ON_LOAD.put(node, Boolean.TRUE);
+            }
             return true;
-        }
-    }
-
-    private static boolean isValidationComplete(Object node) {
-        synchronized (NODES) {
-            return VALIDATED_ON_LOAD.containsKey(node);
         }
     }
 
     private static boolean markNodeObserved(Object node) {
         synchronized (NODES) {
             return OBSERVED_NODES.put(node, Boolean.TRUE) == null;
+        }
+    }
+
+    private static boolean isValidationMarkedComplete(Object node) {
+        synchronized (NODES) {
+            return VALIDATED_ON_LOAD.containsKey(node);
         }
     }
 
